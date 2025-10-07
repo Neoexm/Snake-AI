@@ -23,29 +23,30 @@ from snake_env import SnakeEnv, RewardShaping, FrameStack
 
 
 def make_eval_env(config: Dict, seed: int = 0):
-    """Create evaluation environment from config."""
-    def _init():
-        env = SnakeEnv(
-            grid_size=config['environment']['grid_size'],
-            max_steps=config['environment'].get('max_steps'),
-            render_mode=None,
-        )
-        
-        env = RewardShaping(
-            env,
-            step_penalty=config['environment']['step_penalty'],
-            death_penalty=config['environment']['death_penalty'],
-            food_reward=config['environment']['food_reward'],
-            distance_reward_scale=config['environment'].get('distance_reward_scale', 0.0),
-        )
-        
-        if config['environment'].get('frame_stack', 1) > 1:
-            env = FrameStack(env, n_frames=config['environment']['frame_stack'])
-        
-        env.reset(seed=seed)
-        return env
+    """
+    Create evaluation environment from config.
     
-    return _init
+    Returns the actual environment instance, not a factory.
+    """
+    env = SnakeEnv(
+        grid_size=config['environment']['grid_size'],
+        max_steps=config['environment'].get('max_steps'),
+        render_mode=None,
+    )
+    
+    env = RewardShaping(
+        env,
+        step_penalty=config['environment']['step_penalty'],
+        death_penalty=config['environment']['death_penalty'],
+        food_reward=config['environment']['food_reward'],
+        distance_reward_scale=config['environment'].get('distance_reward_scale', 0.0),
+    )
+    
+    if config['environment'].get('frame_stack', 1) > 1:
+        env = FrameStack(env, n_frames=config['environment']['frame_stack'])
+    
+    env.reset(seed=seed)
+    return env
 
 
 def evaluate_model(
@@ -90,7 +91,7 @@ def evaluate_model(
     model = PPO.load(model_path)
     
     # Create eval environment
-    env = DummyVecEnv([make_eval_env(config, seed=seed + i) for i in range(1)])
+    env = DummyVecEnv([lambda: make_eval_env(config, seed=seed)])
     env = VecMonitor(env)
     
     # Evaluate

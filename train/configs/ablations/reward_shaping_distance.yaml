@@ -10,6 +10,8 @@ environment:
   distance_reward_scale: 0.01  # Enable distance shaping
   frame_stack: 1
 
+policy: CnnPolicy
+
 ppo:
   learning_rate: 0.0003
   n_steps: 256
@@ -26,6 +28,8 @@ ppo:
   use_sde: false
   sde_sample_freq: -1
   target_kl: null
+  policy_kwargs:
+    normalize_images: false
 
 training:
   total_timesteps: 500000

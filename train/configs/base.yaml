@@ -10,6 +10,8 @@ environment:
   distance_reward_scale: 0.0  # 0 = off, try 0.01 for distance shaping
   frame_stack: 1  # Number of frames to stack (1 = off)
 
+policy: CnnPolicy
+
 ppo:
   learning_rate: 0.0003
   n_steps: 256  # Will be overridden by autoscale
@@ -26,6 +28,8 @@ ppo:
   use_sde: false
   sde_sample_freq: -1
   target_kl: null
+  policy_kwargs:
+    normalize_images: false  # Our env outputs float32 [0,1], already normalized
 
 training:
   total_timesteps: 500000  # 500k for quick experiments, use 5M+ for full training
@@ -36,3 +40,4 @@ notes: |
   Base configuration with standard PPO hyperparameters.
   Good starting point for 12x12 grid.
   Increase total_timesteps to 5M+ for better performance.
+  normalize_images is false because our env outputs pre-normalized float32 observations.

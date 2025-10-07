@@ -3,13 +3,14 @@
 
 # Core RL & ML
 gymnasium>=0.29.0,<0.30.0
-stable-baselines3[extra]>=2.3.0,<2.4.0
-# SB3 extras includes: tensorboard, opencv-python, pandas, matplotlib
+stable-baselines3>=2.3.0,<2.4.0
+# Note: Removed [extra] to avoid ale-py dependency conflicts with Python 3.13
 
 # PyTorch CPU (Windows-compatible)
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch>=2.2.0,<3.0.0
-torchvision>=0.17.0,<1.0.0
+torch==2.8.0
+torchvision==0.23.0
+torchaudio==2.8.0
 
 # Core dependencies
 numpy>=1.26.0,<2.0.0

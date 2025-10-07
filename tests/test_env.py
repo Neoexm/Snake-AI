@@ -254,3 +254,41 @@ def test_env_in_loop():
         
         assert steps > 0
         assert done or steps >= 100
+
+
+def test_observation_dtype_and_range():
+    """Test that observations have correct dtype and value range."""
+    env = SnakeEnv(grid_size=12)
+    obs, _ = env.reset(seed=42)
+    
+    # Check shape
+    assert obs.shape == (3, 12, 12), f"Expected shape (3, 12, 12), got {obs.shape}"
+    
+    # Check dtype is float32
+    assert obs.dtype == np.float32, f"Expected dtype float32, got {obs.dtype}"
+    
+    # Check values are in [0, 1] range
+    assert obs.min() >= 0.0, f"Observation has values below 0: {obs.min()}"
+    assert obs.max() <= 1.0, f"Observation has values above 1: {obs.max()}"
+    
+    # Take a step and check again
+    action = env.action_space.sample()
+    obs, _, _, _, _ = env.step(action)
+    
+    assert obs.dtype == np.float32
+    assert obs.min() >= 0.0
+    assert obs.max() <= 1.0
+
+
+def test_sb3_env_checker():
+    """Test environment compatibility with Stable-Baselines3."""
+    from stable_baselines3.common.env_checker import check_env
+    
+    env = SnakeEnv(grid_size=12)
+    
+    # Run SB3's environment checker
+    # This will raise an exception if the environment is not compatible
+    check_env(env, warn=True)
+    
+    # If we get here, the environment passed all checks
+    assert True
