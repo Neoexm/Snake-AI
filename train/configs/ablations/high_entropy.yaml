@@ -1,0 +1,39 @@
+# Ablation: High entropy coefficient
+# Tests impact of increased exploration via entropy bonus
+
+environment:
+  grid_size: 12
+  max_steps: null
+  step_penalty: -0.01
+  death_penalty: -1.0
+  food_reward: 1.0
+  distance_reward_scale: 0.0
+  frame_stack: 1
+
+ppo:
+  learning_rate: 0.0003
+  n_steps: 256
+  batch_size: 512
+  n_epochs: 4
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  clip_range_vf: null
+  normalize_advantage: true
+  ent_coef: 0.05  # Increased from 0.01 to encourage exploration
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  use_sde: false
+  sde_sample_freq: -1
+  target_kl: null
+
+training:
+  total_timesteps: 500000
+  eval_freq: 10000
+  save_freq: 50000
+
+notes: |
+  Ablation study: Higher entropy coefficient (0.05 vs 0.01).
+  Hypothesis: More exploration helps discover better strategies.
+  Compare with base.yaml (ent_coef=0.01).
+  May lead to slower convergence but potentially better final policy.

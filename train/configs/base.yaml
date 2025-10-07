@@ -1,0 +1,38 @@
+# Base configuration for Snake PPO training
+# This is a balanced configuration suitable for most use cases
+
+environment:
+  grid_size: 12
+  max_steps: null  # null = auto (200 * grid_size)
+  step_penalty: -0.01
+  death_penalty: -1.0
+  food_reward: 1.0
+  distance_reward_scale: 0.0  # 0 = off, try 0.01 for distance shaping
+  frame_stack: 1  # Number of frames to stack (1 = off)
+
+ppo:
+  learning_rate: 0.0003
+  n_steps: 256  # Will be overridden by autoscale
+  batch_size: 512  # Will be overridden by autoscale
+  n_epochs: 4
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  clip_range_vf: null
+  normalize_advantage: true
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  use_sde: false
+  sde_sample_freq: -1
+  target_kl: null
+
+training:
+  total_timesteps: 500000  # 500k for quick experiments, use 5M+ for full training
+  eval_freq: 10000
+  save_freq: 50000
+
+notes: |
+  Base configuration with standard PPO hyperparameters.
+  Good starting point for 12x12 grid.
+  Increase total_timesteps to 5M+ for better performance.
