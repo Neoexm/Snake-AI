@@ -1,93 +1,6 @@
 # Snake RL - Reinforcement Learning for IB Extended Essay
 
-A production-quality Snake reinforcement learning environment and training pipeline built for an IB Extended Essay. Features automatic resource scaling, comprehensive logging, live visualization, and reproducible experiments.
-
-## Features
-
-- 🐍 **Gymnasium-compliant Snake environment** with configurable grid size and reward shaping
-- 🤖 **PPO training pipeline** (Stable-Baselines3) with automatic hyperparameter tuning
-- ⚡ **Autoscaling** to maximize GPU/CPU utilization
-- 📊 **TensorBoard logging** + CSV exports + live Streamlit dashboard
-- 🎮 **Live agent visualization** (local window or web-based)
-- 🧪 **Ablation studies** with pre-configured experiments
-- 📈 **Publication-ready plots** for academic reports
-- ✅ **Full test suite** with pytest
-- 🔧 **Code quality tools** (black, ruff, mypy, pre-commit)
-
-## Quick Start
-
-### Windows (CPU Development)
-
-```bash
-# 1. Create virtual environment
-python -m venv .venv
-.venv\Scripts\activate
-
-# 2. Install dependencies
-pip install -r requirements.txt
-
-# 3. Run a quick training experiment
-python train/train_ppo.py --config train/configs/small.yaml --total-timesteps 50000
-
-# 4. Watch the trained agent play
-python train/play.py --model runs/<run_name>/best_model.zip
-
-# 5. View training curves
-tensorboard --logdir runs
-```
-
-### Linux (GPU Cloud)
-
-```bash
-# 1. Create virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
-
-# 2. Install GPU dependencies
-pip install -r requirements-gpu.txt
-
-# 3. Verify GPU
-nvidia-smi
-python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
-
-# 4. Run full training with autoscaling
-python train/train_ppo.py --config train/configs/base.yaml --device cuda --max-utilization
-
-# 5. Launch web dashboard (accessible remotely)
-streamlit run dashboards/app.py --server.address 0.0.0.0 --server.port 7860
-```
-
-## Project Structure
-
-```
-.
-├── snake_env/              # Gymnasium environment package
-│   ├── __init__.py
-│   ├── snake_env.py        # Core Snake environment
-│   └── wrappers.py         # Frame stacking, reward shaping
-├── train/                  # Training scripts
-│   ├── train_ppo.py        # Main training CLI
-│   ├── eval.py             # Standalone evaluation
-│   ├── play.py             # Watch agent play (live window or video)
-│   ├── autoscale.py        # Resource detection and optimization
-│   └── configs/            # Experiment configurations
-│       ├── base.yaml       # Default 12x12 grid
-│       ├── small.yaml      # Quick 8x8 experiments
-│       ├── large.yaml      # Challenging 16x16
-│       └── ablations/      # Ablation studies
-├── dashboards/
-│   └── app.py              # Streamlit web dashboard
-├── scripts/
-│   ├── profile_resources.py    # Live resource monitoring
-│   └── export_plots.py         # Generate publication plots
-├── tests/                  # Unit and integration tests
-├── runs/                   # Training logs and models (git-ignored)
-├── requirements.txt        # Windows CPU dependencies
-├── requirements-gpu.txt    # Linux CUDA dependencies
-└── pyproject.toml          # Code quality configuration
-```
-
-## Usage Guide
+A Project where an AI learns to play snake via RL for a school project
 
 ### Training
 
@@ -316,23 +229,6 @@ See [`EE_METHODS.md`](EE_METHODS.md) for detailed methodology.
 
 **Problem:** Tests failing
 - **Solution:** Ensure dependencies installed: `pip install -r requirements.txt`
-
-## Citation
-
-If using this code for academic work:
-
-```
-@misc{snake-rl-ee,
-  title={Snake Reinforcement Learning Environment and Training Pipeline},
-  author={IB Extended Essay Student},
-  year={2025},
-  howpublished={\url{https://github.com/your-repo/snake-rl}}
-}
-```
-
-## License
-
-MIT License - See LICENSE file for details.
 
 ## Acknowledgments
 
