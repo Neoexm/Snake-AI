@@ -107,13 +107,13 @@ print(f"t-statistic: {t_stat:.3f}, p-value: {p_value:.3f}")
 
 ## Reproducibility Checklist
 
-✅ **Fixed seeds** for all experiments  
-✅ **Version pinning** in requirements.txt  
-✅ **Config snapshots** saved with each run  
-✅ **Deterministic operations** where possible  
-✅ **Same hardware** for all trials  
-✅ **Raw data preserved** (CSV logs)  
-✅ **Code version control** (Git)  
+**Fixed seeds** for all experiments  
+**Version pinning** in requirements.txt  
+**Config snapshots** saved with each run  
+**Deterministic operations** where possible  
+**Same hardware** for all trials  
+**Raw data preserved** (CSV logs)  
+**Code version control** (Git)  
 
 ## Validity Considerations
 
@@ -144,7 +144,7 @@ print(f"t-statistic: {t_stat:.3f}, p-value: {p_value:.3f}")
 
 **Are we measuring what we claim?**
 - Episode reward = agent success ✓
-- Episode length = game duration (not snake size) ⚠️
+- Episode length = game duration (not snake size) 
 - Sample efficiency = learning speed ✓
 
 **Metrics logged in `info` dict:**

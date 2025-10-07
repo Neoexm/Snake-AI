@@ -367,5 +367,3 @@ du -sh runs/
 - [ ] Plots exported successfully
 
 ---
-
-**You're all set! Start with the small config for testing, then scale up to full experiments.**
