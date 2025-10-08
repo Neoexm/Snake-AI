@@ -12,6 +12,9 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+# Force single-GPU usage for evaluation
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
 from stable_baselines3.common.evaluation import evaluate_policy
@@ -85,10 +88,14 @@ def evaluate_model(
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     
-    # Load model
+    # Load model (force cuda:0 for single-GPU eval)
     if verbose:
         print(f"Loading model from: {model_path}")
-    model = PPO.load(model_path)
+    
+    # Ensure we use cuda:0 for evaluation
+    import torch
+    device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+    model = PPO.load(model_path, device=device)
     
     # Create eval environment
     env = DummyVecEnv([lambda: make_eval_env(config, seed=seed)])

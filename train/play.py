@@ -14,6 +14,9 @@ from typing import Optional
 
 import numpy as np
 
+# Force single-GPU usage for playback/visualization
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -58,9 +61,12 @@ def play_local_window(
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     
-    # Load model
+    # Load model (force cuda:0 for single-GPU playback)
     print(f"Loading model from: {model_path}")
-    model = PPO.load(model_path)
+    
+    import torch
+    device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+    model = PPO.load(model_path, device=device)
     
     # Create environment
     env = SnakeEnv(
@@ -183,9 +189,12 @@ def play_headless_video(
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     
-    # Load model
+    # Load model (force cuda:0 for single-GPU video recording)
     print(f"Loading model from: {model_path}")
-    model = PPO.load(model_path)
+    
+    import torch
+    device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+    model = PPO.load(model_path, device=device)
     
     # Create environment
     env = SnakeEnv(

@@ -16,6 +16,8 @@ from typing import Dict, Any, Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import (
     BaseCallback,
@@ -33,6 +35,20 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from snake_env import SnakeEnv, RewardShaping, FrameStack
 from train.autoscale import autoscale
 from train.models import SnakeTinyCNN, SnakeScalableCNN, SnakeDeepCNN
+from train.ddp_utils import (
+    setup_distributed,
+    cleanup_distributed,
+    is_distributed,
+    is_main_process,
+    get_rank,
+    get_world_size,
+    wrap_model_ddp,
+    unwrap_model_ddp,
+    broadcast_model_parameters,
+    all_reduce_dict,
+    setup_nccl_env_for_b200,
+    print_distributed_info,
+)
 from tools.hw_monitor import HardwareMonitor
 
 
@@ -53,32 +69,59 @@ class ThroughputCallback(BaseCallback):
     def _on_step(self) -> bool:
         if self.n_calls % self.log_freq == 0:
             import time
-            elapsed = time.time() - self.start_time
-            fps = self.num_timesteps / elapsed if elapsed > 0 else 0
+            from train.ddp_utils import is_distributed, is_main_process, get_rank, all_reduce_dict
             
-            # Log to TensorBoard
-            self.logger.record("time/fps", fps)
+            elapsed = time.time() - self.start_time
+            local_fps = self.num_timesteps / elapsed if elapsed > 0 else 0
+            
+            # Aggregate FPS across all ranks
+            if is_distributed():
+                fps_data = all_reduce_dict({'fps': local_fps})
+                global_fps = fps_data['fps']
+            else:
+                global_fps = local_fps
+            
+            # Only rank 0 logs to TensorBoard
+            if is_main_process():
+                self.logger.record("time/global_fps", global_fps)
+                self.logger.record("time/local_fps_rank0", local_fps)
             
             # Try to get GPU utilization
             try:
                 import torch
                 if torch.cuda.is_available():
-                    gpu_mem_alloc = torch.cuda.memory_allocated(0) / (1024**3)
-                    gpu_mem_reserved = torch.cuda.memory_reserved(0) / (1024**3)
-                    self.logger.record("system/gpu_memory_allocated_gb", gpu_mem_alloc)
-                    self.logger.record("system/gpu_memory_reserved_gb", gpu_mem_reserved)
+                    rank = get_rank() if is_distributed() else 0
+                    gpu_mem_alloc = torch.cuda.memory_allocated(rank) / (1024**3)
+                    gpu_mem_reserved = torch.cuda.memory_reserved(rank) / (1024**3)
+                    
+                    if is_main_process():
+                        self.logger.record(f"system/gpu{rank}_memory_allocated_gb", gpu_mem_alloc)
+                        self.logger.record(f"system/gpu{rank}_memory_reserved_gb", gpu_mem_reserved)
+                        
+                        # Try to get utilization for all GPUs (rank 0 only)
+                        try:
+                            import nvidia_ml_py3 as nvml
+                            nvml.nvmlInit()
+                            for i in range(torch.cuda.device_count()):
+                                handle = nvml.nvmlDeviceGetHandleByIndex(i)
+                                util = nvml.nvmlDeviceGetUtilizationRates(handle)
+                                self.logger.record(f"system/gpu{i}_util_percent", util.gpu)
+                            nvml.nvmlShutdown()
+                        except:
+                            pass
             except:
                 pass
             
-            # CPU and RAM
-            try:
-                import psutil
-                self.logger.record("system/cpu_percent", psutil.cpu_percent())
-                mem = psutil.virtual_memory()
-                self.logger.record("system/ram_percent", mem.percent)
-                self.logger.record("system/ram_available_gb", mem.available / (1024**3))
-            except:
-                pass
+            # CPU and RAM (rank 0 only)
+            if is_main_process():
+                try:
+                    import psutil
+                    self.logger.record("system/cpu_percent", psutil.cpu_percent())
+                    mem = psutil.virtual_memory()
+                    self.logger.record("system/ram_percent", mem.percent)
+                    self.logger.record("system/ram_available_gb", mem.available / (1024**3))
+                except:
+                    pass
         
         return True
 
@@ -360,6 +403,23 @@ def parse_args():
 
 def main():
     """Main training function."""
+    # Setup NCCL environment variables for B200 GPUs BEFORE initializing distributed
+    setup_nccl_env_for_b200()
+    
+    # Initialize distributed training if running under torchrun
+    rank = 0
+    world_size = 1
+    device = None
+    
+    if os.environ.get('RANK') is not None:
+        # Running under torchrun - initialize distributed
+        try:
+            rank, world_size, device = setup_distributed(backend='nccl')
+            print_distributed_info()
+        except Exception as e:
+            print(f"Warning: Could not initialize distributed training: {e}")
+            print("Falling back to single-GPU mode")
+    
     args = parse_args()
     
     # Load config
@@ -387,7 +447,8 @@ def main():
             max_n_envs=args.max_n_envs,
             max_batch_size=args.max_batch_size,
         )
-        resource_config.print_summary()
+        if is_main_process():
+            resource_config.print_summary()
     else:
         # Manual configuration when auto-scale is disabled
         from train.autoscale import detect_cuda, detect_cpu, ResourceConfig
@@ -409,50 +470,76 @@ def main():
             env_processes=args.env_processes != "false" if args.env_processes else True,
         )
     
-    # Set seeds
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    # Set seeds with rank-dependent offset for diversity
+    base_seed = args.seed
+    rank_seed = base_seed + rank
+    np.random.seed(rank_seed)
+    torch.manual_seed(rank_seed)
+    
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-        # Deterministic operations (may reduce performance slightly)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        torch.cuda.manual_seed_all(rank_seed)
+        # For distributed training, use non-deterministic for better performance
+        if is_distributed():
+            torch.use_deterministic_algorithms(mode=False)
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.deterministic = False
+        else:
+            # Single GPU can be more deterministic
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
     
-    # Create run directory
-    base_run_name = args.run_name or datetime.now().strftime("%Y%m%d-%H%M%S")
-    if args.run_suffix:
-        run_name = f"{base_run_name}_{args.run_suffix}"
+    # Create run directory (only rank 0)
+    if is_main_process():
+        base_run_name = args.run_name or datetime.now().strftime("%Y%m%d-%H%M%S")
+        if args.run_suffix:
+            run_name = f"{base_run_name}_{args.run_suffix}"
+        else:
+            run_name = base_run_name
+        run_dir = Path(args.logdir) / run_name
+        run_dir.mkdir(parents=True, exist_ok=True)
     else:
-        run_name = base_run_name
-    run_dir = Path(args.logdir) / run_name
-    run_dir.mkdir(parents=True, exist_ok=True)
+        # Non-zero ranks: wait for rank 0 to create directory, then use it
+        import time
+        time.sleep(2)  # Small delay to ensure rank 0 creates directory
+        base_run_name = args.run_name or datetime.now().strftime("%Y%m%d-%H%M%S")
+        if args.run_suffix:
+            run_name = f"{base_run_name}_{args.run_suffix}"
+        else:
+            run_name = base_run_name
+        run_dir = Path(args.logdir) / run_name
     
-    # Save config and autoscale info
-    config['autoscale'] = {
-        'enabled': auto_scale_enabled,
-        'device': resource_config.device,
-        'n_envs': resource_config.n_envs,
-        'n_steps': resource_config.n_steps,
-        'batch_size': resource_config.batch_size,
-        'use_amp': resource_config.use_amp,
-        'policy_width': resource_config.policy_width,
-        'policy_depth': resource_config.policy_depth,
-        'precision': resource_config.precision,
-        'compile_mode': resource_config.compile_mode,
-    }
-    config['seed'] = args.seed
-    config['cli_args'] = vars(args)
-    save_config(config, str(run_dir / "config.yaml"))
-    
-    # Save system info using hardware monitor
-    try:
-        monitor = HardwareMonitor()
-        monitor.save_system_info(run_dir / "system.json")
-    except Exception as e:
-        print(f"Warning: Could not save system info: {e}")
-    
-    print(f"\n📁 Run directory: {run_dir}")
-    print(f"📝 Config saved to: {run_dir / 'config.yaml'}\n")
+    # Save config and autoscale info (rank 0 only)
+    if is_main_process():
+        config['autoscale'] = {
+            'enabled': auto_scale_enabled,
+            'device': resource_config.device,
+            'n_envs': resource_config.n_envs,
+            'n_steps': resource_config.n_steps,
+            'batch_size': resource_config.batch_size,
+            'use_amp': resource_config.use_amp,
+            'policy_width': resource_config.policy_width,
+            'policy_depth': resource_config.policy_depth,
+            'precision': resource_config.precision,
+            'compile_mode': resource_config.compile_mode,
+        }
+        config['distributed'] = {
+            'enabled': is_distributed(),
+            'world_size': world_size,
+            'backend': 'nccl' if is_distributed() else None,
+        }
+        config['seed'] = base_seed
+        config['cli_args'] = vars(args)
+        save_config(config, str(run_dir / "config.yaml"))
+        
+        # Save system info using hardware monitor
+        try:
+            monitor = HardwareMonitor()
+            monitor.save_system_info(run_dir / "system.json")
+        except Exception as e:
+            print(f"Warning: Could not save system info: {e}")
+        
+        print(f"\n📁 Run directory: {run_dir}")
+        print(f"📝 Config saved to: {run_dir / 'config.yaml'}\n")
     
     # Create vectorized environment
     env_kwargs = {
@@ -651,33 +738,44 @@ def main():
                           f"{gpu.memory_percent:.1f}% mem")
                 print("="*60)
     
-    # Save final model
-    final_path = run_dir / "final_model.zip"
-    model.save(str(final_path))
-    
-    # Save effective config (after auto-tuning)
-    effective_config = config.copy()
-    effective_config['effective_autoscale'] = {
-        'device': resource_config.device,
-        'n_envs': resource_config.n_envs,
-        'n_steps': resource_config.n_steps,
-        'batch_size': resource_config.batch_size,
-        'policy_width': resource_config.policy_width,
-        'policy_depth': resource_config.policy_depth,
-        'precision': resource_config.precision,
-    }
-    save_config(effective_config, str(run_dir / "effective_config.yaml"))
-    
-    print(f"\n✅ Training complete!")
-    print(f"📦 Final model saved to: {final_path}")
-    print(f"🏆 Best model saved to: {run_dir / 'best_model.zip'}")
-    print(f"📝 Effective config saved to: {run_dir / 'effective_config.yaml'}")
-    print(f"\n📊 View training progress:")
-    print(f"   tensorboard --logdir {run_dir}")
+    # Save final model (rank 0 only, unwrap DDP first)
+    if is_main_process():
+        final_path = run_dir / "final_model.zip"
+        
+        # Unwrap DDP before saving
+        if is_distributed():
+            model.policy = unwrap_model_ddp(model.policy)
+        
+        model.save(str(final_path))
+        
+        # Save effective config (after auto-tuning)
+        effective_config = config.copy()
+        effective_config['effective_autoscale'] = {
+            'device': resource_config.device,
+            'n_envs': resource_config.n_envs,
+            'n_steps': resource_config.n_steps,
+            'batch_size': resource_config.batch_size,
+            'policy_width': resource_config.policy_width,
+            'policy_depth': resource_config.policy_depth,
+            'precision': resource_config.precision,
+        }
+        save_config(effective_config, str(run_dir / "effective_config.yaml"))
+        
+        print(f"\n✅ Training complete!")
+        print(f"📦 Final model saved to: {final_path}")
+        print(f"🏆 Best model saved to: {run_dir / 'best_model.zip'}")
+        print(f"📝 Effective config saved to: {run_dir / 'effective_config.yaml'}")
+        print(f"\n📊 View training progress:")
+        print(f"   tensorboard --logdir {run_dir}")
     
     # Cleanup
     env.close()
-    eval_env.close()
+    if eval_env is not None:
+        eval_env.close()
+    
+    # Cleanup distributed
+    if is_distributed():
+        cleanup_distributed()
 
 
 if __name__ == "__main__":

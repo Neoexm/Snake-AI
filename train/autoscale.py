@@ -209,14 +209,14 @@ def autoscale(
     elif use_gpu:
         # Scale with GPU memory - more aggressive for high utilization
         mem_gb = gpu_info['primary_memory_gb']
-        if mem_gb >= 80:  # H100, MI300X
-            n_envs = 128 if max_utilization else 96
+        if mem_gb >= 80:  # B200, H100, MI300X (192GB B200 gets 256 envs total / 4 GPUs = 64 per GPU)
+            n_envs = 256 if max_utilization else 192
         elif mem_gb >= 40:  # A100 80GB
-            n_envs = 96 if max_utilization else 64
+            n_envs = 128 if max_utilization else 96
         elif mem_gb >= 24:  # A100 40GB, RTX 4090
-            n_envs = 64 if max_utilization else 48
+            n_envs = 96 if max_utilization else 64
         elif mem_gb >= 16:  # V100, RTX 3090
-            n_envs = 48 if max_utilization else 32
+            n_envs = 64 if max_utilization else 48
         elif mem_gb >= 8:  # RTX 3070
             n_envs = 32 if max_utilization else 24
         else:
@@ -237,15 +237,23 @@ def autoscale(
     # Determine n_steps (PPO rollout buffer size)
     # Larger for GPU (more memory), smaller for CPU
     if use_gpu:
-        n_steps = 512 if max_utilization else 256
+        mem_gb = gpu_info['primary_memory_gb']
+        if mem_gb >= 80:  # B200, H100 - can handle larger rollouts
+            n_steps = 1024 if max_utilization else 512
+        else:
+            n_steps = 512 if max_utilization else 256
     else:
         n_steps = 256
     
     # Batch size: should divide (n_envs * n_steps) evenly
     total_samples = n_envs * n_steps
     if use_gpu:
+        mem_gb = gpu_info['primary_memory_gb']
         # Prefer larger batches on GPU for better throughput
-        batch_size = min(4096, total_samples // 2) if max_utilization else min(2048, total_samples // 4)
+        if mem_gb >= 80:  # B200, H100 - can handle 8192+ batch sizes
+            batch_size = min(8192, total_samples // 2) if max_utilization else min(4096, total_samples // 4)
+        else:
+            batch_size = min(4096, total_samples // 2) if max_utilization else min(2048, total_samples // 4)
     else:
         batch_size = min(1024, total_samples // 4)
     
@@ -269,7 +277,9 @@ def autoscale(
         policy_width = override_policy_width
     elif use_gpu:
         mem_gb = gpu_info['primary_memory_gb']
-        if mem_gb >= 40 and max_utilization:
+        if mem_gb >= 80:  # B200, H100
+            policy_width = 128
+        elif mem_gb >= 40 and max_utilization:
             policy_width = 128
         elif mem_gb >= 24:
             policy_width = 64 if max_utilization else 32
