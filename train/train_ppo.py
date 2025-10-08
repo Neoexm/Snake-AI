@@ -32,7 +32,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from snake_env import SnakeEnv, RewardShaping, FrameStack
 from train.autoscale import autoscale
-from train.models import SnakeTinyCNN
+from train.models import SnakeTinyCNN, SnakeScalableCNN, SnakeDeepCNN
+from tools.hw_monitor import HardwareMonitor
 
 
 class ThroughputCallback(BaseCallback):
@@ -207,6 +208,12 @@ def parse_args():
         default=42,
         help="Random seed",
     )
+    parser.add_argument(
+        "--run-suffix",
+        type=str,
+        default=None,
+        help="Suffix to append to run name",
+    )
     
     # Resource management
     parser.add_argument(
@@ -226,6 +233,89 @@ def parse_args():
         "--max-utilization",
         action="store_true",
         help="Maximize resource utilization (may risk OOM)",
+    )
+    parser.add_argument(
+        "--auto-scale",
+        type=str,
+        choices=["true", "false"],
+        default="true",
+        help="Enable auto-scaling (default: true)",
+    )
+    parser.add_argument(
+        "--max-n-envs",
+        type=int,
+        default=None,
+        help="Hard cap on number of environments",
+    )
+    parser.add_argument(
+        "--max-batch-size",
+        type=int,
+        default=None,
+        help="Hard cap on batch size",
+    )
+    
+    # Policy/Network configuration
+    parser.add_argument(
+        "--policy-width",
+        type=int,
+        default=None,
+        help="CNN width (number of channels)",
+    )
+    parser.add_argument(
+        "--policy-depth",
+        type=int,
+        default=None,
+        help="CNN depth (number of conv layers)",
+    )
+    parser.add_argument(
+        "--policy-arch",
+        type=str,
+        choices=["tiny", "scalable", "deep"],
+        default="scalable",
+        help="Policy architecture to use",
+    )
+    
+    # Performance optimizations
+    parser.add_argument(
+        "--precision",
+        type=str,
+        choices=["fp32", "amp"],
+        default=None,
+        help="Precision mode (fp32 or amp for mixed precision)",
+    )
+    parser.add_argument(
+        "--compile",
+        type=str,
+        choices=["none", "default"],
+        default=None,
+        help="Torch compile mode",
+    )
+    parser.add_argument(
+        "--pin-memory",
+        action="store_true",
+        help="Pin memory for faster CPU->GPU transfer",
+    )
+    parser.add_argument(
+        "--env-processes",
+        type=str,
+        choices=["true", "false"],
+        default=None,
+        help="Use SubprocVecEnv (true) or DummyVecEnv (false)",
+    )
+    
+    # Image preprocessing
+    parser.add_argument(
+        "--normalize-images",
+        type=str,
+        choices=["true", "false"],
+        default="false",
+        help="Normalize images (our images are already normalized)",
+    )
+    parser.add_argument(
+        "--frame-stack",
+        type=int,
+        default=None,
+        help="Number of frames to stack (overrides config)",
     )
     
     # Evaluation
@@ -263,35 +353,83 @@ def main():
     # Override config with CLI args
     if args.total_timesteps is not None:
         config['training']['total_timesteps'] = args.total_timesteps
+    if args.frame_stack is not None:
+        config['environment']['frame_stack'] = args.frame_stack
     
     # Autoscale resources
+    auto_scale_enabled = args.auto_scale == "true"
     prefer_device = args.device if args.device != "auto" else None
-    resource_config = autoscale(
-        max_utilization=args.max_utilization,
-        prefer_device=prefer_device,
-        override_n_envs=args.n_envs,
-    )
-    resource_config.print_summary()
+    
+    if auto_scale_enabled:
+        resource_config = autoscale(
+            max_utilization=args.max_utilization,
+            prefer_device=prefer_device,
+            override_n_envs=args.n_envs,
+            override_policy_width=args.policy_width,
+            override_policy_depth=args.policy_depth,
+            override_precision=args.precision,
+            override_compile=args.compile,
+            max_n_envs=args.max_n_envs,
+            max_batch_size=args.max_batch_size,
+        )
+        resource_config.print_summary()
+    else:
+        # Manual configuration when auto-scale is disabled
+        from train.autoscale import detect_cuda, detect_cpu, ResourceConfig
+        resource_config = ResourceConfig(
+            device=args.device if args.device != "auto" else "cpu",
+            n_envs=args.n_envs or 4,
+            n_steps=256,
+            batch_size=512,
+            num_workers=0,
+            use_amp=args.precision == "amp" if args.precision else False,
+            pin_memory=args.pin_memory,
+            num_threads=None,
+            gpu_info=detect_cuda(),
+            cpu_info=detect_cpu(),
+            policy_width=args.policy_width or 32,
+            policy_depth=args.policy_depth or 2,
+            precision=args.precision or "fp32",
+            compile_mode=args.compile or "none",
+            env_processes=args.env_processes != "false" if args.env_processes else True,
+        )
     
     # Set seeds
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     
     # Create run directory
-    run_name = args.run_name or datetime.now().strftime("%Y%m%d-%H%M%S")
+    base_run_name = args.run_name or datetime.now().strftime("%Y%m%d-%H%M%S")
+    if args.run_suffix:
+        run_name = f"{base_run_name}_{args.run_suffix}"
+    else:
+        run_name = base_run_name
     run_dir = Path(args.logdir) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     
     # Save config and autoscale info
     config['autoscale'] = {
+        'enabled': auto_scale_enabled,
         'device': resource_config.device,
         'n_envs': resource_config.n_envs,
         'n_steps': resource_config.n_steps,
         'batch_size': resource_config.batch_size,
         'use_amp': resource_config.use_amp,
+        'policy_width': resource_config.policy_width,
+        'policy_depth': resource_config.policy_depth,
+        'precision': resource_config.precision,
+        'compile_mode': resource_config.compile_mode,
     }
     config['seed'] = args.seed
+    config['cli_args'] = vars(args)
     save_config(config, str(run_dir / "config.yaml"))
+    
+    # Save system info using hardware monitor
+    try:
+        monitor = HardwareMonitor()
+        monitor.save_system_info(run_dir / "system.json")
+    except Exception as e:
+        print(f"Warning: Could not save system info: {e}")
     
     print(f"\n📁 Run directory: {run_dir}")
     print(f"📝 Config saved to: {run_dir / 'config.yaml'}\n")
@@ -309,8 +447,14 @@ def main():
         'render_mode': None,  # Headless for training
     }
     
-    # Use SubprocVecEnv on Linux, DummyVecEnv on Windows
-    vec_env_cls = SubprocVecEnv if sys.platform != 'win32' else DummyVecEnv
+    # Choose vec env class
+    if args.env_processes == "true":
+        vec_env_cls = SubprocVecEnv
+    elif args.env_processes == "false":
+        vec_env_cls = DummyVecEnv
+    else:
+        # Auto: use subprocess on Linux, dummy on Windows
+        vec_env_cls = SubprocVecEnv if resource_config.env_processes else DummyVecEnv
     
     # Create list of environment factories
     # Use lambda with default argument to avoid late binding issue
@@ -339,13 +483,30 @@ def main():
     # Extract policy_kwargs from ppo config
     policy_kwargs = ppo_kwargs.pop('policy_kwargs', {})
     
-    # Configure custom CNN for small observations (works for 8x8 to 16x16 grids)
-    # This replaces SB3's NatureCNN which has kernels too large for 12x12 inputs
-    policy_kwargs.setdefault('features_extractor_class', SnakeTinyCNN)
-    policy_kwargs.setdefault('features_extractor_kwargs', {'features_dim': 256})
+    # Select policy architecture
+    if args.policy_arch == "tiny":
+        extractor_class = SnakeTinyCNN
+        extractor_kwargs = {'features_dim': 256}
+    elif args.policy_arch == "deep":
+        extractor_class = SnakeDeepCNN
+        extractor_kwargs = {
+            'features_dim': 256,
+            'width': resource_config.policy_width,
+        }
+    else:  # scalable (default)
+        extractor_class = SnakeScalableCNN
+        extractor_kwargs = {
+            'features_dim': 256,
+            'width': resource_config.policy_width,
+            'depth': resource_config.policy_depth,
+        }
     
-    # Ensure normalize_images is False for our pre-normalized float32 observations
-    policy_kwargs.setdefault('normalize_images', False)
+    policy_kwargs['features_extractor_class'] = extractor_class
+    policy_kwargs['features_extractor_kwargs'] = extractor_kwargs
+    
+    # Normalize images setting
+    normalize_images = args.normalize_images == "true" if args.normalize_images else False
+    policy_kwargs['normalize_images'] = normalize_images
     
     # Get policy type from config
     policy = config.get('policy', 'CnnPolicy')
@@ -353,9 +514,12 @@ def main():
     # Create PPO model
     print("🤖 Creating PPO model...")
     print(f"Policy: {policy}")
-    print(f"Features Extractor: {policy_kwargs.get('features_extractor_class', 'default').__name__}")
-    print(f"Features Dim: {policy_kwargs.get('features_extractor_kwargs', {}).get('features_dim', 'default')}")
-    print(f"normalize_images: {policy_kwargs.get('normalize_images', False)}")
+    print(f"Architecture: {args.policy_arch}")
+    print(f"Features Extractor: {policy_kwargs['features_extractor_class'].__name__}")
+    print(f"Extractor Config: {policy_kwargs['features_extractor_kwargs']}")
+    print(f"normalize_images: {policy_kwargs['normalize_images']}")
+    print(f"Precision: {resource_config.precision}")
+    print(f"Compile: {resource_config.compile_mode}")
     
     model = PPO(
         policy=policy,
@@ -365,6 +529,15 @@ def main():
         tensorboard_log=str(run_dir),
         verbose=1,
     )
+    
+    # Apply torch compile if requested
+    if resource_config.compile_mode == "default":
+        try:
+            if hasattr(torch, 'compile'):
+                print("Compiling model with torch.compile...")
+                model.policy = torch.compile(model.policy)
+        except Exception as e:
+            print(f"Warning: Could not compile model: {e}")
     
     # Setup custom logger for CSV output
     logger = configure(str(run_dir), ["stdout", "csv", "tensorboard"])
@@ -401,6 +574,19 @@ def main():
     
     callback_list = CallbackList(callbacks)
     
+    # Start hardware monitoring
+    hw_monitor = None
+    try:
+        hw_monitor = HardwareMonitor(
+            poll_interval=1.0,
+            log_dir=run_dir,
+            tensorboard_logger=model.logger,
+        )
+        hw_monitor.start()
+        print("✓ Hardware monitoring started")
+    except Exception as e:
+        print(f"Warning: Could not start hardware monitoring: {e}")
+    
     # Train
     print(f"\n🚀 Starting training for {config['training']['total_timesteps']:,} timesteps...\n")
     
@@ -413,13 +599,45 @@ def main():
         )
     except KeyboardInterrupt:
         print("\n⚠️  Training interrupted by user")
+    finally:
+        # Stop hardware monitoring
+        if hw_monitor:
+            hw_monitor.stop()
+            
+            # Print average stats
+            avg_stats = hw_monitor.get_average_stats(last_n_seconds=120)
+            if avg_stats:
+                print("\n" + "="*60)
+                print("AVERAGE HARDWARE UTILIZATION (last 2 minutes)")
+                print("="*60)
+                print(f"CPU: {avg_stats.cpu_percent:.1f}%")
+                print(f"RAM: {avg_stats.ram_percent:.1f}%")
+                for gpu in avg_stats.gpus:
+                    print(f"GPU {gpu.device_id}: {gpu.utilization_percent:.1f}% util, "
+                          f"{gpu.memory_percent:.1f}% mem")
+                print("="*60)
     
     # Save final model
     final_path = run_dir / "final_model.zip"
     model.save(str(final_path))
+    
+    # Save effective config (after auto-tuning)
+    effective_config = config.copy()
+    effective_config['effective_autoscale'] = {
+        'device': resource_config.device,
+        'n_envs': resource_config.n_envs,
+        'n_steps': resource_config.n_steps,
+        'batch_size': resource_config.batch_size,
+        'policy_width': resource_config.policy_width,
+        'policy_depth': resource_config.policy_depth,
+        'precision': resource_config.precision,
+    }
+    save_config(effective_config, str(run_dir / "effective_config.yaml"))
+    
     print(f"\n✅ Training complete!")
     print(f"📦 Final model saved to: {final_path}")
     print(f"🏆 Best model saved to: {run_dir / 'best_model.zip'}")
+    print(f"📝 Effective config saved to: {run_dir / 'effective_config.yaml'}")
     print(f"\n📊 View training progress:")
     print(f"   tensorboard --logdir {run_dir}")
     

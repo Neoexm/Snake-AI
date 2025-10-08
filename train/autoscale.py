@@ -10,7 +10,7 @@ import sys
 import psutil
 import warnings
 from typing import Dict, Any, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -28,6 +28,17 @@ class ResourceConfig:
     gpu_info: Dict[str, Any]
     cpu_info: Dict[str, Any]
     
+    # New scalability parameters
+    policy_width: int = 32
+    policy_depth: int = 2
+    max_n_envs: Optional[int] = None
+    max_batch_size: Optional[int] = None
+    precision: str = "fp32"  # "fp32" or "amp"
+    compile_mode: str = "none"  # "none" or "default"
+    env_processes: bool = True
+    normalize_images: bool = False
+    frame_stack: int = 1
+    
     def print_summary(self):
         """Print a human-readable summary of the configuration."""
         print("\n" + "="*60)
@@ -37,6 +48,11 @@ class ResourceConfig:
         print(f"Parallel Environments: {self.n_envs}")
         print(f"Steps per Rollout: {self.n_steps}")
         print(f"Batch Size: {self.batch_size}")
+        print(f"Policy Width: {self.policy_width}")
+        print(f"Policy Depth: {self.policy_depth}")
+        print(f"Precision: {self.precision}")
+        print(f"Compile Mode: {self.compile_mode}")
+        print(f"Subprocess Envs: {self.env_processes}")
         print(f"Dataloader Workers: {self.num_workers}")
         print(f"Mixed Precision (AMP): {self.use_amp}")
         print(f"Pin Memory: {self.pin_memory}")
@@ -132,6 +148,12 @@ def autoscale(
     max_utilization: bool = False,
     prefer_device: Optional[str] = None,
     override_n_envs: Optional[int] = None,
+    override_policy_width: Optional[int] = None,
+    override_policy_depth: Optional[int] = None,
+    override_precision: Optional[str] = None,
+    override_compile: Optional[str] = None,
+    max_n_envs: Optional[int] = None,
+    max_batch_size: Optional[int] = None,
 ) -> ResourceConfig:
     """
     Automatically determine optimal training configuration.
@@ -144,6 +166,18 @@ def autoscale(
         Force 'cuda', 'cpu', or 'auto' (default).
     override_n_envs : int, optional
         Manually override the number of parallel environments.
+    override_policy_width : int, optional
+        Override policy network width.
+    override_policy_depth : int, optional
+        Override policy network depth.
+    override_precision : str, optional
+        Override precision mode ("fp32" or "amp").
+    override_compile : str, optional
+        Override compile mode ("none" or "default").
+    max_n_envs : int, optional
+        Maximum number of environments (hard cap).
+    max_batch_size : int, optional
+        Maximum batch size (hard cap).
     
     Returns
     -------
@@ -173,20 +207,32 @@ def autoscale(
     if override_n_envs is not None:
         n_envs = override_n_envs
     elif use_gpu:
-        # Scale with GPU memory
+        # Scale with GPU memory - more aggressive for high utilization
         mem_gb = gpu_info['primary_memory_gb']
-        if mem_gb >= 24:
+        if mem_gb >= 80:  # H100, MI300X
+            n_envs = 128 if max_utilization else 96
+        elif mem_gb >= 40:  # A100 80GB
+            n_envs = 96 if max_utilization else 64
+        elif mem_gb >= 24:  # A100 40GB, RTX 4090
             n_envs = 64 if max_utilization else 48
-        elif mem_gb >= 16:
+        elif mem_gb >= 16:  # V100, RTX 3090
             n_envs = 48 if max_utilization else 32
-        elif mem_gb >= 8:
+        elif mem_gb >= 8:  # RTX 3070
             n_envs = 32 if max_utilization else 24
         else:
             n_envs = 16
     else:
-        # CPU: use physical cores, but cap to avoid thrashing
+        # CPU: scale with logical cores for Windows, capped
+        logical_cores = cpu_info['logical_cores']
         phys_cores = cpu_info['physical_cores']
-        n_envs = min(phys_cores, 8) if not max_utilization else min(phys_cores, 16)
+        if max_utilization:
+            n_envs = min(logical_cores * 2, 256)
+        else:
+            n_envs = min(phys_cores, 16)
+    
+    # Apply hard cap if specified
+    if max_n_envs is not None:
+        n_envs = min(n_envs, max_n_envs)
     
     # Determine n_steps (PPO rollout buffer size)
     # Larger for GPU (more memory), smaller for CPU
@@ -198,27 +244,69 @@ def autoscale(
     # Batch size: should divide (n_envs * n_steps) evenly
     total_samples = n_envs * n_steps
     if use_gpu:
-        # Prefer larger batches on GPU
-        batch_size = min(2048, total_samples // 2) if max_utilization else min(1024, total_samples // 4)
+        # Prefer larger batches on GPU for better throughput
+        batch_size = min(4096, total_samples // 2) if max_utilization else min(2048, total_samples // 4)
     else:
-        batch_size = min(512, total_samples // 4)
+        batch_size = min(1024, total_samples // 4)
+    
+    # Apply hard cap if specified
+    if max_batch_size is not None:
+        batch_size = min(batch_size, max_batch_size)
     
     # Ensure batch_size divides total_samples
     if total_samples % batch_size != 0:
         # Adjust to nearest divisor
-        for candidate in [2048, 1024, 512, 256, 128, 64]:
-            if total_samples % candidate == 0:
+        for candidate in [4096, 2048, 1024, 512, 256, 128, 64, 32]:
+            if candidate <= batch_size and total_samples % candidate == 0:
                 batch_size = candidate
                 break
     
     # Dataloader workers (for experience collection)
     num_workers = 0  # SB3 doesn't use dataloader workers for envs
     
+    # Policy network sizing based on GPU capability
+    if override_policy_width is not None:
+        policy_width = override_policy_width
+    elif use_gpu:
+        mem_gb = gpu_info['primary_memory_gb']
+        if mem_gb >= 40 and max_utilization:
+            policy_width = 128
+        elif mem_gb >= 24:
+            policy_width = 64 if max_utilization else 32
+        else:
+            policy_width = 32
+    else:
+        policy_width = 32
+    
+    if override_policy_depth is not None:
+        policy_depth = override_policy_depth
+    elif use_gpu and max_utilization:
+        policy_depth = 3
+    else:
+        policy_depth = 2
+    
+    # Precision mode
+    if override_precision is not None:
+        precision = override_precision
+    elif use_gpu and max_utilization:
+        precision = "amp"
+    else:
+        precision = "fp32"
+    
     # AMP (Automatic Mixed Precision) for CUDA
-    use_amp = use_gpu and max_utilization
+    use_amp = precision == "amp"
+    
+    # Compile mode
+    if override_compile is not None:
+        compile_mode = override_compile
+    else:
+        compile_mode = "none"  # Conservative default
     
     # Pin memory for faster CPU->GPU transfer
     pin_memory = use_gpu
+    
+    # Use subprocess envs on Linux
+    env_processes = sys.platform != 'win32'
     
     # CPU threading
     num_threads = None
@@ -250,6 +338,13 @@ def autoscale(
         num_threads=num_threads,
         gpu_info=gpu_info,
         cpu_info=cpu_info,
+        policy_width=policy_width,
+        policy_depth=policy_depth,
+        max_n_envs=max_n_envs,
+        max_batch_size=max_batch_size,
+        precision=precision,
+        compile_mode=compile_mode,
+        env_processes=env_processes,
     )
 
 
