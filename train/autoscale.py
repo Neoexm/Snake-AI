@@ -203,30 +203,35 @@ def autoscale(
         use_gpu = gpu_info['available']
         device = 'cuda' if use_gpu else 'cpu'
     
-    # Determine n_envs
+    # Determine n_envs (PER-RANK in DDP mode, total in single-GPU mode)
+    # In DDP: Each rank creates n_envs environments
+    # Total environments = n_envs × world_size
     if override_n_envs is not None:
         n_envs = override_n_envs
     elif use_gpu:
         # Scale with GPU memory - more aggressive for high utilization
+        # NOTE: For DDP on 4×B200 GPUs, n_envs=64/GPU → 256 total environments
         mem_gb = gpu_info['primary_memory_gb']
-        if mem_gb >= 80:  # B200, H100, MI300X (192GB B200 gets 256 envs total / 4 GPUs = 64 per GPU)
-            n_envs = 256 if max_utilization else 192
-        elif mem_gb >= 40:  # A100 80GB
-            n_envs = 128 if max_utilization else 96
-        elif mem_gb >= 24:  # A100 40GB, RTX 4090
-            n_envs = 96 if max_utilization else 64
-        elif mem_gb >= 16:  # V100, RTX 3090
+        if mem_gb >= 80:  # B200 (192GB), H100 (80GB), MI300X
+            # DDP mode: 64 envs/GPU × 4 GPUs = 256 total
+            # Single-GPU: 256 envs on one GPU
             n_envs = 64 if max_utilization else 48
-        elif mem_gb >= 8:  # RTX 3070
+        elif mem_gb >= 40:  # A100 80GB
+            n_envs = 48 if max_utilization else 32
+        elif mem_gb >= 24:  # A100 40GB, RTX 4090
             n_envs = 32 if max_utilization else 24
+        elif mem_gb >= 16:  # V100, RTX 3090
+            n_envs = 24 if max_utilization else 16
+        elif mem_gb >= 8:  # RTX 3070
+            n_envs = 16 if max_utilization else 12
         else:
-            n_envs = 16
+            n_envs = 8
     else:
         # CPU: scale with logical cores for Windows, capped
         logical_cores = cpu_info['logical_cores']
         phys_cores = cpu_info['physical_cores']
         if max_utilization:
-            n_envs = min(logical_cores * 2, 256)
+            n_envs = min(logical_cores * 2, 64)
         else:
             n_envs = min(phys_cores, 16)
     
@@ -240,8 +245,10 @@ def autoscale(
         mem_gb = gpu_info['primary_memory_gb']
         if mem_gb >= 80:  # B200, H100 - can handle larger rollouts
             n_steps = 1024 if max_utilization else 512
-        else:
+        elif mem_gb >= 40:
             n_steps = 512 if max_utilization else 256
+        else:
+            n_steps = 256
     else:
         n_steps = 256
     
@@ -250,12 +257,18 @@ def autoscale(
     if use_gpu:
         mem_gb = gpu_info['primary_memory_gb']
         # Prefer larger batches on GPU for better throughput
+        # B200 with 64 envs × 1024 steps = 65536 samples/rank
         if mem_gb >= 80:  # B200, H100 - can handle 8192+ batch sizes
-            batch_size = min(8192, total_samples // 2) if max_utilization else min(4096, total_samples // 4)
+            batch_size = 8192 if max_utilization else 4096
+        elif mem_gb >= 40:
+            batch_size = 4096 if max_utilization else 2048
         else:
-            batch_size = min(4096, total_samples // 2) if max_utilization else min(2048, total_samples // 4)
+            batch_size = 2048 if max_utilization else 1024
     else:
         batch_size = min(1024, total_samples // 4)
+    
+    # Ensure batch_size doesn't exceed total_samples
+    batch_size = min(batch_size, total_samples // 2)
     
     # Apply hard cap if specified
     if max_batch_size is not None:

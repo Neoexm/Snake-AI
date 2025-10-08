@@ -565,10 +565,14 @@ def main():
     
     # Create list of environment factories
     # Use lambda with default argument to avoid late binding issue
+    # In DDP: each rank creates n_envs environments with unique global ranks
     env_fns = [
-        lambda i=i: make_snake_env(**{**env_kwargs, 'rank': i})
+        lambda i=i: make_snake_env(**{**env_kwargs, 'rank': rank * resource_config.n_envs + i})
         for i in range(resource_config.n_envs)
     ]
+    
+    if is_main_process():
+        print(f"[Rank {rank}] Creating {resource_config.n_envs} environments (global ranks {rank * resource_config.n_envs} to {(rank + 1) * resource_config.n_envs - 1})")
     
     env = vec_env_cls(env_fns)
     env = VecMonitor(env)
@@ -619,24 +623,41 @@ def main():
     policy = config.get('policy', 'CnnPolicy')
     
     # Create PPO model
-    print("🤖 Creating PPO model...")
-    print(f"Policy: {policy}")
+    if is_main_process():
+        print("🤖 Creating PPO model...")
+        print(f"Policy: {policy}")
     
     if args.resume_from:
-        print(f"📂 Resuming from checkpoint: {args.resume_from}")
+        if is_main_process():
+            print(f"📂 Resuming from checkpoint: {args.resume_from}")
         model = PPO.load(
             args.resume_from,
             env=env,
             tensorboard_log=str(run_dir),
         )
-        print(f"✓ Loaded checkpoint at {model.num_timesteps:,} timesteps")
+        if is_main_process():
+            print(f"✓ Loaded checkpoint at {model.num_timesteps:,} timesteps")
+        
+        # Re-wrap in DDP after loading
+        if is_distributed():
+            model.policy = wrap_model_ddp(
+                model.policy,
+                device_ids=[rank],
+                output_device=rank,
+                find_unused_parameters=False,
+            )
+            # Broadcast to ensure all ranks have same weights
+            broadcast_model_parameters(model.policy, src=0)
+            if is_main_process():
+                print(f"✓ [Rank {rank}] DDP re-wrapping complete after resume, parameters synchronized")
     else:
-        print(f"Architecture: {args.policy_arch}")
-        print(f"Features Extractor: {policy_kwargs['features_extractor_class'].__name__}")
-        print(f"Extractor Config: {policy_kwargs['features_extractor_kwargs']}")
-        print(f"normalize_images: {policy_kwargs['normalize_images']}")
-        print(f"Precision: {resource_config.precision}")
-        print(f"Compile: {resource_config.compile_mode}")
+        if is_main_process():
+            print(f"Architecture: {args.policy_arch}")
+            print(f"Features Extractor: {policy_kwargs['features_extractor_class'].__name__}")
+            print(f"Extractor Config: {policy_kwargs['features_extractor_kwargs']}")
+            print(f"normalize_images: {policy_kwargs['normalize_images']}")
+            print(f"Precision: {resource_config.precision}")
+            print(f"Compile: {resource_config.compile_mode}")
         
         model = PPO(
             policy=policy,
@@ -644,46 +665,67 @@ def main():
             policy_kwargs=policy_kwargs,
             **ppo_kwargs,
             tensorboard_log=str(run_dir),
-            verbose=1,
+            verbose=1 if is_main_process() else 0,
         )
+        
+        # CRITICAL: Wrap policy in DDP for true distributed training
+        if is_distributed():
+            model.policy = wrap_model_ddp(
+                model.policy,
+                device_ids=[rank],
+                output_device=rank,
+                find_unused_parameters=False,
+            )
+            # Broadcast initial parameters from rank 0 to all ranks
+            broadcast_model_parameters(model.policy, src=0)
+            if is_main_process():
+                print(f"✓ [Rank {rank}] DDP wrapping complete, parameters synchronized")
     
-    # Apply torch compile if requested
+    # Apply torch compile if requested (after DDP wrapping)
     if resource_config.compile_mode == "default":
         try:
             if hasattr(torch, 'compile'):
-                print("Compiling model with torch.compile...")
+                if is_main_process():
+                    print("Compiling model with torch.compile...")
                 model.policy = torch.compile(model.policy)
         except Exception as e:
-            print(f"Warning: Could not compile model: {e}")
+            if is_main_process():
+                print(f"Warning: Could not compile model: {e}")
     
     # Setup custom logger for CSV output
-    logger = configure(str(run_dir), ["stdout", "csv", "tensorboard"])
+    # Only rank 0 should log to TensorBoard to avoid conflicts
+    if is_main_process():
+        logger = configure(str(run_dir), ["stdout", "csv", "tensorboard"])
+    else:
+        # Non-zero ranks: only stdout, no TensorBoard
+        logger = configure(str(run_dir), ["stdout"])
     model.set_logger(logger)
     
-    # Create callbacks
+    # Create callbacks (only rank 0 saves checkpoints)
     callbacks = []
     
-    # Checkpoint callback
-    checkpoint_callback = CheckpointCallback(
-        save_freq=max(args.save_freq // resource_config.n_envs, 1),
-        save_path=str(run_dir / "checkpoints"),
-        name_prefix="model",
-        save_replay_buffer=False,
-        save_vecnormalize=True,
-    )
-    callbacks.append(checkpoint_callback)
-    
-    # Evaluation callback
-    eval_callback = EvalCallback(
-        eval_env,
-        best_model_save_path=str(run_dir),
-        log_path=str(run_dir / "eval"),
-        eval_freq=max(args.eval_freq // resource_config.n_envs, 1),
-        n_eval_episodes=args.eval_episodes,
-        deterministic=True,
-        render=False,
-    )
-    callbacks.append(eval_callback)
+    # Checkpoint callback (rank 0 only)
+    if is_main_process():
+        checkpoint_callback = CheckpointCallback(
+            save_freq=max(args.save_freq // resource_config.n_envs, 1),
+            save_path=str(run_dir / "checkpoints"),
+            name_prefix="model",
+            save_replay_buffer=False,
+            save_vecnormalize=True,
+        )
+        callbacks.append(checkpoint_callback)
+        
+        # Evaluation callback (rank 0 only)
+        eval_callback = EvalCallback(
+            eval_env,
+            best_model_save_path=str(run_dir),
+            log_path=str(run_dir / "eval"),
+            eval_freq=max(args.eval_freq // resource_config.n_envs, 1),
+            n_eval_episodes=args.eval_episodes,
+            deterministic=True,
+            render=False,
+        )
+        callbacks.append(eval_callback)
     
     # Throughput callback
     throughput_callback = ThroughputCallback(log_freq=1000)
@@ -691,21 +733,26 @@ def main():
     
     callback_list = CallbackList(callbacks)
     
-    # Start hardware monitoring
+    # Start hardware monitoring (rank 0 only)
     hw_monitor = None
-    try:
-        hw_monitor = HardwareMonitor(
-            poll_interval=1.0,
-            log_dir=run_dir,
-            tensorboard_logger=model.logger,
-        )
-        hw_monitor.start()
-        print("✓ Hardware monitoring started")
-    except Exception as e:
-        print(f"Warning: Could not start hardware monitoring: {e}")
+    if is_main_process():
+        try:
+            hw_monitor = HardwareMonitor(
+                poll_interval=1.0,
+                log_dir=run_dir,
+                tensorboard_logger=model.logger,
+            )
+            hw_monitor.start()
+            print("✓ Hardware monitoring started")
+        except Exception as e:
+            print(f"Warning: Could not start hardware monitoring: {e}")
     
     # Train
-    print(f"\n🚀 Starting training for {config['training']['total_timesteps']:,} timesteps...\n")
+    if is_main_process():
+        total_envs = resource_config.n_envs * world_size if is_distributed() else resource_config.n_envs
+        print(f"\n🚀 Starting training for {config['training']['total_timesteps']:,} timesteps...")
+        print(f"Total environments across all ranks: {total_envs}")
+        print(f"Environments per rank: {resource_config.n_envs}\n")
     
     try:
         model.learn(

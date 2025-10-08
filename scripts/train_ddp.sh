@@ -1,57 +1,41 @@
 #!/bin/bash
-# Launch distributed training on 4×B200 GPUs using torchrun
-#
-# Usage:
-#   bash scripts/train_ddp.sh [additional args to train_ppo.py]
-#
-# Examples:
-#   bash scripts/train_ddp.sh --config train/configs/large.yaml
-#   bash scripts/train_ddp.sh --total-timesteps 10000000 --max-utilization
+set -e
 
-set -e  # Exit on error
-
-# Distributed training configuration
-export MASTER_ADDR=localhost
-export MASTER_PORT=29500
-
-# Number of GPUs (adjust if not using 4)
-NPROC_PER_NODE=4
-
-# Default config if not specified
+# Default config
 CONFIG=${1:-train/configs/large.yaml}
+TOTAL_TIMESTEPS=${2:-10000000}
+SEED=${3:-42}
 
-# Generate run name with timestamp
+# Generate run name
 RUN_NAME="ddp_4xb200_$(date +%Y%m%d_%H%M%S)"
 
-echo "================================================"
-echo "Multi-GPU Distributed Training"
-echo "================================================"
-echo "GPUs: ${NPROC_PER_NODE}"
-echo "Config: ${CONFIG}"
-echo "Run Name: ${RUN_NAME}"
-echo "Master: ${MASTER_ADDR}:${MASTER_PORT}"
-echo "================================================"
-echo ""
+# Create runs directory if it doesn't exist
+mkdir -p runs
 
-# Launch distributed training with torchrun
+echo "================================================"
+echo "Multi-GPU DDP Training"
+echo "================================================"
+echo "GPUs: 4"
+echo "Config: ${CONFIG}"
+echo "Total Timesteps: ${TOTAL_TIMESTEPS}"
+echo "Seed: ${SEED}"
+echo "Run Name: ${RUN_NAME}"
+echo "================================================"
+
+# Launch with torchrun
 torchrun \
     --standalone \
     --nnodes=1 \
-    --nproc-per-node=${NPROC_PER_NODE} \
+    --nproc-per-node=4 \
     train/train_ppo.py \
     --config "${CONFIG}" \
     --device cuda \
-    --precision amp \
+    --total-timesteps ${TOTAL_TIMESTEPS} \
+    --seed ${SEED} \
     --run-name "${RUN_NAME}" \
-    --seed 42 \
-    --auto-scale true \
-    --max-utilization \
-    "${@:2}"  # Pass remaining args to train_ppo.py
+    --precision amp \
+    --max-utilization
 
 echo ""
-echo "================================================"
-echo "Training Complete!"
-echo "================================================"
-echo "View results with:"
-echo "  tensorboard --logdir runs/${RUN_NAME} --host 0.0.0.0 --port 6006"
-echo "================================================"
+echo "✅ Training complete! View results:"
+echo "   tensorboard --logdir runs/${RUN_NAME} --host 0.0.0.0 --port 6006"
