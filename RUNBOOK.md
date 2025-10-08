@@ -78,7 +78,31 @@ python train/play.py --model runs/<run_name>/best_model.zip --fps 10
 python train/eval.py --model runs/<run_name>/best_model.zip --n-episodes 100 --output eval_results.json
 ```
 
-### 7. Web Dashboard
+### 7. Resume Training from Checkpoint
+
+If training is interrupted, resume from the latest checkpoint:
+
+```powershell
+# Find the latest checkpoint
+# (Windows PowerShell)
+$CHECKPOINT = (Get-ChildItem runs\<run_name>\checkpoints\*.zip | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+
+# Resume training
+python train/train_ppo.py `
+  --config runs/<run_name>/config.yaml `
+  --resume-from $CHECKPOINT `
+  --device cuda `
+  --run-name <run_name>_resumed
+
+# Or use the saved checkpoint path directly
+python train/train_ppo.py `
+  --config train/configs/base.yaml `
+  --resume-from runs/20250115-143022/checkpoints/model_500000_steps.zip `
+  --device cuda `
+  --total-timesteps 5000000
+```
+
+### 8. Web Dashboard
 
 ```powershell
 # Launch Streamlit dashboard
@@ -87,7 +111,7 @@ streamlit run dashboards/app.py
 # Then open: http://localhost:8501
 ```
 
-### 8. Generate Plots for EE
+### 9. Generate Plots for EE
 
 ```powershell
 # Export publication-ready plots
@@ -205,6 +229,29 @@ python train/play.py \
 
 # Download video to local machine with scp:
 # scp user@server:~/snake-rl/agent_gameplay.mp4 .
+```
+
+### 8. Resume Training from Checkpoint
+
+If training is interrupted, resume from the latest checkpoint:
+
+```bash
+# Find the latest checkpoint
+CHECKPOINT=$(ls -t runs/<run_name>/checkpoints/*.zip | head -1)
+
+# Resume training
+python train/train_ppo.py \
+  --config runs/<run_name>/config.yaml \
+  --resume-from $CHECKPOINT \
+  --device cuda \
+  --run-name <run_name>_resumed
+
+# Or use the saved checkpoint path directly
+python train/train_ppo.py \
+  --config train/configs/base.yaml \
+  --resume-from runs/20250115-143022/checkpoints/model_500000_steps.zip \
+  --device cuda \
+  --total-timesteps 5000000
 ```
 
 ---

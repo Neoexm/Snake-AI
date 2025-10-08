@@ -130,6 +130,15 @@ def make_snake_env(
     gym.Env
         The configured Snake environment instance.
     """
+    # Set deterministic seeds for this worker
+    import random
+    worker_seed = seed + rank
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(worker_seed)
+    
     env = SnakeEnv(
         grid_size=grid_size,
         max_steps=max_steps,
@@ -339,6 +348,12 @@ def parse_args():
         default=50000,
         help="Save checkpoint every N timesteps",
     )
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="Path to checkpoint to resume from (.zip file)",
+    )
     
     return parser.parse_args()
 
@@ -397,6 +412,11 @@ def main():
     # Set seeds
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+        # Deterministic operations (may reduce performance slightly)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
     
     # Create run directory
     base_run_name = args.run_name or datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -514,21 +534,31 @@ def main():
     # Create PPO model
     print("🤖 Creating PPO model...")
     print(f"Policy: {policy}")
-    print(f"Architecture: {args.policy_arch}")
-    print(f"Features Extractor: {policy_kwargs['features_extractor_class'].__name__}")
-    print(f"Extractor Config: {policy_kwargs['features_extractor_kwargs']}")
-    print(f"normalize_images: {policy_kwargs['normalize_images']}")
-    print(f"Precision: {resource_config.precision}")
-    print(f"Compile: {resource_config.compile_mode}")
     
-    model = PPO(
-        policy=policy,
-        env=env,
-        policy_kwargs=policy_kwargs,
-        **ppo_kwargs,
-        tensorboard_log=str(run_dir),
-        verbose=1,
-    )
+    if args.resume_from:
+        print(f"📂 Resuming from checkpoint: {args.resume_from}")
+        model = PPO.load(
+            args.resume_from,
+            env=env,
+            tensorboard_log=str(run_dir),
+        )
+        print(f"✓ Loaded checkpoint at {model.num_timesteps:,} timesteps")
+    else:
+        print(f"Architecture: {args.policy_arch}")
+        print(f"Features Extractor: {policy_kwargs['features_extractor_class'].__name__}")
+        print(f"Extractor Config: {policy_kwargs['features_extractor_kwargs']}")
+        print(f"normalize_images: {policy_kwargs['normalize_images']}")
+        print(f"Precision: {resource_config.precision}")
+        print(f"Compile: {resource_config.compile_mode}")
+        
+        model = PPO(
+            policy=policy,
+            env=env,
+            policy_kwargs=policy_kwargs,
+            **ppo_kwargs,
+            tensorboard_log=str(run_dir),
+            verbose=1,
+        )
     
     # Apply torch compile if requested
     if resource_config.compile_mode == "default":
@@ -592,7 +622,11 @@ def main():
     
     try:
         model.learn(
-            total_timesteps=config['training']['total_timesteps'],
+            total_timesteps=(
+                config['training']['total_timesteps'] - model.num_timesteps
+                if args.resume_from
+                else config['training']['total_timesteps']
+            ),
             callback=callback_list,
             log_interval=10,
             progress_bar=True,

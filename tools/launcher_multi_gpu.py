@@ -167,8 +167,8 @@ def launch_training_process(
     # Unique seed for this GPU
     seed = base_seed + gpu_id
     
-    # Unique run name
-    gpu_run_name = f"{run_name}_gpu{gpu_id}"
+    # Unique run name (includes GPU ID and seed to prevent log collisions)
+    gpu_run_name = f"{run_name}_gpu{gpu_id}_seed{seed}"
     
     # Log file for this GPU
     log_file = logdir / f"run_gpu{gpu_id}.log"
