@@ -2,6 +2,7 @@
 Standalone evaluation script for trained Snake PPO agents.
 
 Runs fixed-seed evaluation episodes and logs metrics without training.
+CRITICAL: Does NOT set CUDA_VISIBLE_DEVICES to allow DDP-trained models to load correctly.
 """
 
 import os
@@ -11,9 +12,6 @@ import yaml
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple
-
-# Force single-GPU usage for evaluation
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
@@ -88,13 +86,22 @@ def evaluate_model(
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     
-    # Load model (force cuda:0 for single-GPU eval)
+    # Load model on available GPU (auto-detect, don't hardcode cuda:0)
     if verbose:
         print(f"Loading model from: {model_path}")
     
-    # Ensure we use cuda:0 for evaluation
     import torch
-    device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    # Set deterministic mode for reproducible evaluation
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(mode=True, warn_only=True)
+    
     model = PPO.load(model_path, device=device)
     
     # Create eval environment
@@ -103,7 +110,7 @@ def evaluate_model(
     
     # Evaluate
     if verbose:
-        print(f"Evaluating for {n_eval_episodes} episodes...")
+        print(f"Evaluating for {n_eval_episodes} episodes (deterministic mode)...")
     
     episode_rewards = []
     episode_lengths = []

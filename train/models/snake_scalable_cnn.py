@@ -68,6 +68,14 @@ class SnakeScalableCNN(BaseFeaturesExtractor):
         height = observation_space.shape[1]
         width_spatial = observation_space.shape[2]
         
+        # CRITICAL: Support frame stacking (C can be 3, 6, 9, 12, etc.)
+        if n_input_channels % 3 != 0:
+            import warnings
+            warnings.warn(
+                f"Unexpected channel count {n_input_channels}. "
+                f"Snake env produces 3 channels; with frame_stack=N, expect 3*N channels."
+            )
+        
         # Build convolutional layers
         layers = []
         
@@ -121,6 +129,16 @@ class SnakeScalableCNN(BaseFeaturesExtractor):
         torch.Tensor
             Extracted features with shape (batch_size, features_dim)
         """
+        # Validate input range (only in training mode, sample check to avoid overhead)
+        if self.training and torch.rand(1).item() < 0.01:
+            if observations.min() < -0.1 or observations.max() > 1.1:
+                import warnings
+                warnings.warn(
+                    f"Input observations out of expected [0, 1] range: "
+                    f"min={observations.min().item():.3f}, max={observations.max().item():.3f}. "
+                    f"Check normalize_images setting or env preprocessing."
+                )
+        
         x = self.cnn(observations)
         x = self.linear(x)
         return x

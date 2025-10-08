@@ -204,40 +204,72 @@ def barrier():
         dist.barrier()
 
 
+def _detect_network_interface():
+    """Auto-detect primary network interface for NCCL."""
+    try:
+        import subprocess
+        result = subprocess.run(['ip', 'route'], capture_output=True, text=True, timeout=2)
+        if result.returncode == 0:
+            for line in result.stdout.split('\n'):
+                if 'default' in line:
+                    parts = line.split()
+                    if 'dev' in parts:
+                        idx = parts.index('dev')
+                        if idx + 1 < len(parts):
+                            return parts[idx + 1]
+    except:
+        pass
+    return 'eth0'
+
+
 def setup_nccl_env_for_b200():
     """
     Set up NCCL environment variables optimized for NVIDIA B200 GPUs.
     
     B200 features:
-    - NVLink 5.0 (900 GB/s bandwidth)
-    - InfiniBand support
-    - PCIe Gen 5.0
+    - NVLink 5.0 (900 GB/s bandwidth per link, 18 links = 16.2 TB/s)
+    - 192GB HBM3e memory
+    - InfiniBand support (if available)
+    - PCIe Gen 5.0 (128 GB/s)
+    
+    Optimizations:
+    - Force NVLink usage (P2P_LEVEL=NVL) for intra-node
+    - Enable expandable memory segments for large models
+    - Pin memory arenas to reduce fragmentation
+    - Auto-detect network interface (fallback: eth0)
     """
-    os.environ.update({
+    net_iface = _detect_network_interface()
+    
+    env_vars = {
         # Enable InfiniBand (disable only if not available)
         'NCCL_IB_DISABLE': '0',
         
         # Enable P2P (NVLink)
         'NCCL_P2P_DISABLE': '0',
         
-        # Use NVLink for intra-node communication
+        # Force NVLink for intra-node (critical for B200)
         'NCCL_P2P_LEVEL': 'NVL',
         
-        # Network interface (adjust for your system)
-        'NCCL_SOCKET_IFNAME': 'eth0',
+        # Network interface (auto-detected or fallback to eth0)
+        'NCCL_SOCKET_IFNAME': net_iface,
         
-        # CUDA memory allocator configuration
-        'PYTORCH_CUDA_ALLOC_CONF': 'max_split_size_mb:128',
+        # CUDA memory allocator: expandable segments + reasonable split size
+        'PYTORCH_CUDA_ALLOC_CONF': 'expandable_segments:True,max_split_size_mb:128',
         
-        # Reduce malloc overhead
+        # Reduce malloc overhead (critical for multi-GPU)
         'MALLOC_ARENA_MAX': '1',
         
         # Debug level (WARN for production, INFO for debugging)
-        'NCCL_DEBUG': 'WARN',
+        'NCCL_DEBUG': os.environ.get('NCCL_DEBUG', 'WARN'),
         
-        # Disable timeout for debugging (remove in production)
-        # 'NCCL_TIMEOUT': '0',
-    })
+        # Enable async error handling
+        'NCCL_ASYNC_ERROR_HANDLING': '1',
+    }
+    
+    # Only set if not already present (allow user override)
+    for key, value in env_vars.items():
+        if key not in os.environ:
+            os.environ[key] = value
 
 
 def print_distributed_info():
@@ -257,7 +289,31 @@ def print_distributed_info():
             print(f"CUDA Devices: {torch.cuda.device_count()}")
             for i in range(torch.cuda.device_count()):
                 props = torch.cuda.get_device_properties(i)
-                print(f"  GPU {i}: {props.name} ({props.total_memory / 1e9:.1f} GB)")
+                mem_gb = props.total_memory / 1e9
+                compute = f"{props.major}.{props.minor}"
+                print(f"  GPU {i}: {props.name} ({mem_gb:.1f} GB, Compute {compute})")
+            
+            # Check NVLink connectivity
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ['nvidia-smi', 'nvlink', '--status'],
+                    capture_output=True,
+                    text=True,
+                    timeout=2
+                )
+                if result.returncode == 0 and 'Active' in result.stdout:
+                    print("  NVLink: ✓ Active")
+                else:
+                    print("  NVLink: ✗ Inactive (will use PCIe)")
+            except:
+                pass
+        
+        # Print NCCL config
+        print("\nNCCL Configuration:")
+        for key in ['NCCL_P2P_LEVEL', 'NCCL_IB_DISABLE', 'NCCL_DEBUG']:
+            val = os.environ.get(key, 'not set')
+            print(f"  {key}={val}")
         
         print("="*60 + "\n")
     else:

@@ -1,0 +1,79 @@
+# Configuration optimized for 4×NVIDIA B200 GPUs (768GB total VRAM)
+# Target: Maximum throughput with AMP, large batch sizes, deep policy network
+# Expected: 50k+ FPS on 4×B200 with DDP
+
+environment:
+  grid_size: 12
+  max_steps: null  # auto = 200 * grid_size = 2400
+  step_penalty: -0.01
+  death_penalty: -1.0
+  food_reward: 1.0
+  distance_reward_scale: 0.0
+  frame_stack: 1
+
+autoscale:
+  n_envs_per_gpu: 64  # 64 envs/GPU = 256 total on 4 GPUs
+  policy_width: 128
+  policy_depth: 3
+
+policy: CnnPolicy
+
+ppo:
+  learning_rate: 0.0003
+  n_steps: 2048  # Large rollout buffer per GPU (64 envs × 2048 = 131k samples/GPU, 524k total)
+  batch_size: 16384  # FIXED: divisible by (256 envs × 2048 steps = 524288) / 32 = 16384
+  n_epochs: 4
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  clip_range_vf: null
+  normalize_advantage: true
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  use_sde: false
+  sde_sample_freq: -1
+  target_kl: null
+  policy_kwargs:
+    normalize_images: false  # CRITICAL: obs already in [0,1], no normalization needed
+
+training:
+  total_timesteps: 50000000  # 50M for full training (~2-3 hours on 4×B200)
+  eval_freq: 100000  # Evaluate every 100k steps
+  save_freq: 500000  # Save checkpoint every 500k steps
+
+notes: |
+  Optimized for 4×NVIDIA B200 GPUs with DDP + AMP.
+  
+  Per-GPU config:
+  - 64 environments (256 total)
+  - 2048 rollout steps
+  - 128-wide, 3-layer deep CNN
+  - AMP (mixed precision)
+  - Batch size 16384 (divisible)
+  
+  Total (4 GPUs):
+  - 256 environments (64 per GPU)
+  - Effective rollout: 524,288 samples per update (256 envs × 2048 steps)
+  - Mini-batch: 16,384 samples per gradient step
+  - 32 gradient steps per update (524k / 16k)
+  
+  Memory estimate per B200:
+  - Model: ~2GB (128-wide, 3-layer CNN)
+  - Rollout buffer: ~8GB (64 envs × 2048 steps × 3 channels × 12×12)
+  - Optimizer state: ~4GB (AdamW)
+  - Peak: ~20-25GB per GPU (leaves 170GB headroom)
+  
+  Expected throughput:
+  - Single GPU: ~12,000 FPS
+  - 4×GPU (DDP): ~45,000 FPS (3.75x scaling)
+  
+  Launch command:
+    ./launch_b200_full.sh
+  
+  Or manually:
+    torchrun --standalone --nproc-per-node=4 train/train_ppo.py \
+      --config train/configs/b200.yaml \
+      --device cuda \
+      --precision amp \
+      --n-envs 64

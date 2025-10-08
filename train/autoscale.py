@@ -211,10 +211,13 @@ def autoscale(
     elif use_gpu:
         # Scale with GPU memory - more aggressive for high utilization
         mem_gb = gpu_info['primary_memory_gb']
-        if mem_gb >= 192:  # B200 specifically (192GB VRAM)
+        gpu_name = gpu_info.get('primary_name', '').lower()
+        is_b200 = mem_gb >= 175 or 'b200' in gpu_name or 'blackwell' in gpu_name
+        
+        if is_b200:  # B200 specifically (192GB VRAM, ~10-15GB reserved = 177-182GB usable)
             # B200: Massive VRAM allows much larger env counts
-            # DDP mode: 256 envs/GPU × 4 GPUs = 1024 total
-            # Single-GPU: 512 envs on one GPU
+            # DDP mode: 256 envs/GPU × 4 GPUs = 1024 total concurrent envs
+            # Single-GPU: 512 envs for maximum throughput
             n_envs = 256 if max_utilization else 128
         elif mem_gb >= 80:  # H100 (80GB), MI300X
             # DDP mode: 64 envs/GPU × 4 GPUs = 256 total
@@ -247,7 +250,10 @@ def autoscale(
     # Larger for GPU (more memory), smaller for CPU
     if use_gpu:
         mem_gb = gpu_info['primary_memory_gb']
-        if mem_gb >= 192:  # B200 - can handle very large rollouts
+        gpu_name = gpu_info.get('primary_name', '').lower()
+        is_b200 = mem_gb >= 175 or 'b200' in gpu_name or 'blackwell' in gpu_name
+        
+        if is_b200:  # B200 - can handle very large rollouts
             n_steps = 2048 if max_utilization else 1024
         elif mem_gb >= 80:  # H100 - can handle larger rollouts
             n_steps = 1024 if max_utilization else 512
@@ -262,10 +268,13 @@ def autoscale(
     total_samples = n_envs * n_steps
     if use_gpu:
         mem_gb = gpu_info['primary_memory_gb']
+        gpu_name = gpu_info.get('primary_name', '').lower()
+        is_b200 = mem_gb >= 175 or 'b200' in gpu_name or 'blackwell' in gpu_name
+        
         # Prefer larger batches on GPU for better throughput
         # B200 with 256 envs × 2048 steps = 524288 samples/rank (max util)
         # B200 with 128 envs × 1024 steps = 131072 samples/rank (standard)
-        if mem_gb >= 192:  # B200 - can handle very large batch sizes
+        if is_b200:  # B200 - can handle very large batch sizes
             batch_size = 32768 if max_utilization else 16384
         elif mem_gb >= 80:  # H100 - can handle 8192+ batch sizes
             batch_size = 8192 if max_utilization else 4096
@@ -299,7 +308,10 @@ def autoscale(
         policy_width = override_policy_width
     elif use_gpu:
         mem_gb = gpu_info['primary_memory_gb']
-        if mem_gb >= 192:  # B200 - can handle wider networks
+        gpu_name = gpu_info.get('primary_name', '').lower()
+        is_b200 = mem_gb >= 175 or 'b200' in gpu_name or 'blackwell' in gpu_name
+        
+        if is_b200:  # B200 - can handle wider networks
             policy_width = 256 if max_utilization else 128
         elif mem_gb >= 80:  # H100
             policy_width = 128
@@ -316,7 +328,10 @@ def autoscale(
         policy_depth = override_policy_depth
     elif use_gpu:
         mem_gb = gpu_info['primary_memory_gb']
-        if mem_gb >= 192:  # B200 - can handle deeper networks
+        gpu_name = gpu_info.get('primary_name', '').lower()
+        is_b200 = mem_gb >= 175 or 'b200' in gpu_name or 'blackwell' in gpu_name
+        
+        if is_b200:  # B200 - can handle deeper networks
             policy_depth = 4 if max_utilization else 3
         elif max_utilization:
             policy_depth = 3

@@ -2,6 +2,7 @@
 Interactive visualization of a trained Snake PPO agent.
 
 Supports both local window display (OpenCV/Pygame) and headless mode for saving videos.
+CRITICAL: Does NOT set CUDA_VISIBLE_DEVICES to allow loading DDP-trained models.
 """
 
 import os
@@ -13,9 +14,6 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-
-# Force single-GPU usage for playback/visualization
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -61,11 +59,11 @@ def play_local_window(
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     
-    # Load model (force cuda:0 for single-GPU playback)
+    # Load model (auto-detect available GPU)
     print(f"Loading model from: {model_path}")
     
     import torch
-    device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = PPO.load(model_path, device=device)
     
     # Create environment
@@ -189,11 +187,11 @@ def play_headless_video(
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     
-    # Load model (force cuda:0 for single-GPU video recording)
+    # Load model (auto-detect available GPU)
     print(f"Loading model from: {model_path}")
     
     import torch
-    device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = PPO.load(model_path, device=device)
     
     # Create environment
@@ -295,7 +293,18 @@ def parse_args():
         "--video",
         type=str,
         default=None,
-        help="Save video to file (headless mode)",
+        help="Save video to file (headless mode, deprecated: use --record)",
+    )
+    parser.add_argument(
+        "--record",
+        action="store_true",
+        help="Record episodes to videos in --output directory",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="videos",
+        help="Output directory for recorded videos (with --record)",
     )
     
     return parser.parse_args()
@@ -320,16 +329,34 @@ def main():
     
     deterministic = not args.stochastic
     
-    if args.video:
+    if args.video or args.record:
         # Headless video mode
-        play_headless_video(
-            model_path=args.model,
-            config_path=str(config_path),
-            output_path=args.video,
-            fps=args.fps,
-            n_episodes=args.n_episodes or 1,
-            seed=args.seed,
-        )
+        if args.record:
+            output_dir = Path(args.output)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            n_eps = args.n_episodes or 5
+            
+            print(f"\n🎬 Recording {n_eps} episodes to {output_dir}")
+            for ep in range(n_eps):
+                output_path = output_dir / f"episode_{ep+1:03d}.mp4"
+                play_headless_video(
+                    model_path=args.model,
+                    config_path=str(config_path),
+                    output_path=str(output_path),
+                    fps=args.fps,
+                    n_episodes=1,
+                    seed=args.seed + ep,
+                )
+            print(f"✅ All videos saved to: {output_dir}")
+        else:
+            play_headless_video(
+                model_path=args.model,
+                config_path=str(config_path),
+                output_path=args.video,
+                fps=args.fps,
+                n_episodes=args.n_episodes or 1,
+                seed=args.seed,
+            )
     else:
         # Local window mode
         play_local_window(

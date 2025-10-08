@@ -1,12 +1,12 @@
 # Snake RL Project - Linux CUDA 12.4 + PyTorch 2.8+ GPU Requirements
-# Tested on: Ubuntu 22.04, Python 3.10+, CUDA 12.4+, 4×NVIDIA B200
-# Last updated: 2025-01-15
+# Target: Ubuntu 22.04, Python 3.10-3.12, CUDA 12.4+, 4×NVIDIA B200
+# Runpod "PyTorch 2.8.0" template compatible
 
-# PyTorch 2.8+ with CUDA 12.4 (for distributed training on B200)
---extra-index-url https://download.pytorch.org/whl/cu124
-torch>=2.8.0,<2.9.0
-torchvision>=0.23.0,<0.24.0
-torchaudio>=2.8.0,<2.9.0
+# PyTorch 2.8+ with CUDA 12.4 (for DDP on B200)
+# Note: Use Runpod's pre-installed torch or install from wheel
+torch>=2.8.0
+torchvision>=0.18.0
+torchaudio>=2.5.0
 
 # Core RL stack (pinned for stability)
 gymnasium>=0.29.0

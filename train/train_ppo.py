@@ -46,6 +46,7 @@ from train.ddp_utils import (
     unwrap_model_ddp,
     broadcast_model_parameters,
     all_reduce_dict,
+    barrier,
     setup_nccl_env_for_b200,
     print_distributed_info,
 )
@@ -563,19 +564,39 @@ def main():
         # Auto: use subprocess on Linux, dummy on Windows
         vec_env_cls = SubprocVecEnv if resource_config.env_processes else DummyVecEnv
     
-    # Create list of environment factories
-    # Use lambda with default argument to avoid late binding issue
-    # In DDP: each rank creates n_envs environments with unique global ranks
+    # Create list of environment factories with PROPER closure capture
+    # Critical: each rank creates n_envs with unique global IDs for seeding diversity
+    def _make_env(local_idx: int, rank_id: int, n_per_rank: int, base_seed: int, kw: dict):
+        global_env_id = rank_id * n_per_rank + local_idx
+        return make_snake_env(**{**kw, 'rank': global_env_id, 'seed': base_seed})
+    
+    # FIXED: Use functools.partial to properly capture loop variable
+    from functools import partial
     env_fns = [
-        lambda i=i: make_snake_env(**{**env_kwargs, 'rank': rank * resource_config.n_envs + i})
+        partial(_make_env, i, rank, resource_config.n_envs, args.seed, env_kwargs)
         for i in range(resource_config.n_envs)
     ]
     
     if is_main_process():
-        print(f"[Rank {rank}] Creating {resource_config.n_envs} environments (global ranks {rank * resource_config.n_envs} to {(rank + 1) * resource_config.n_envs - 1})")
+        global_start = rank * resource_config.n_envs
+        global_end = (rank + 1) * resource_config.n_envs - 1
+        print(f"[Rank {rank}] Creating {resource_config.n_envs} environments (global IDs {global_start}–{global_end})")
     
     env = vec_env_cls(env_fns)
     env = VecMonitor(env)
+    
+    # CRITICAL: Validate observation space matches expected CNN input
+    expected_channels = 3 * config['environment'].get('frame_stack', 1)
+    actual_channels = env.observation_space.shape[0]
+    if actual_channels != expected_channels:
+        raise ValueError(
+            f"Observation space channel mismatch! "
+            f"Expected {expected_channels} channels (3 × frame_stack={config['environment'].get('frame_stack', 1)}), "
+            f"but got {actual_channels}. Check FrameStack wrapper or CNN input layer."
+        )
+    
+    if is_main_process():
+        print(f"✓ Observation space validated: {env.observation_space.shape}")
     
     # Create eval environment
     eval_env_fns = [
@@ -590,6 +611,23 @@ def main():
     ppo_kwargs['n_steps'] = resource_config.n_steps
     ppo_kwargs['batch_size'] = resource_config.batch_size
     ppo_kwargs['device'] = resource_config.device
+    
+    # CRITICAL: Validate batch_size divides rollout evenly
+    effective_envs = resource_config.n_envs * world_size if is_distributed() else resource_config.n_envs
+    rollout_size = effective_envs * resource_config.n_steps
+    if rollout_size % ppo_kwargs['batch_size'] != 0:
+        if is_main_process():
+            print(f"⚠️  WARNING: batch_size {ppo_kwargs['batch_size']} does not divide "
+                  f"rollout size {rollout_size} evenly!")
+            print(f"   This may cause SB3 to truncate data. Adjusting batch_size...")
+        
+        # Auto-adjust to largest divisor <= batch_size
+        for candidate in range(ppo_kwargs['batch_size'], 0, -1):
+            if rollout_size % candidate == 0:
+                ppo_kwargs['batch_size'] = candidate
+                if is_main_process():
+                    print(f"   Adjusted batch_size to {candidate}")
+                break
     
     # Extract policy_kwargs from ppo config
     policy_kwargs = ppo_kwargs.pop('policy_kwargs', {})
@@ -630,15 +668,31 @@ def main():
     if args.resume_from:
         if is_main_process():
             print(f"📂 Resuming from checkpoint: {args.resume_from}")
+        
+        # Load on CPU first to avoid GPU memory issues
         model = PPO.load(
             args.resume_from,
             env=env,
+            device='cpu',
             tensorboard_log=str(run_dir),
         )
+        
+        # CRITICAL: Broadcast parameters from rank 0 BEFORE moving to GPU
+        if is_distributed():
+            broadcast_model_parameters(model.policy, src=0)
+            barrier()
+            if is_main_process():
+                print(f"✓ [Rank {rank}] Checkpoint loaded, weights synchronized")
+        
+        # Move to correct device AFTER sync
+        model.policy.to(resource_config.device)
+        if hasattr(model, 'policy_old'):
+            model.policy_old.to(resource_config.device)
+        
         if is_main_process():
             print(f"✓ Loaded checkpoint at {model.num_timesteps:,} timesteps")
         
-        # Re-wrap in DDP after loading
+        # Now wrap in DDP after sync + device move
         if is_distributed():
             model.policy = wrap_model_ddp(
                 model.policy,
@@ -646,10 +700,8 @@ def main():
                 output_device=rank,
                 find_unused_parameters=False,
             )
-            # Broadcast to ensure all ranks have same weights
-            broadcast_model_parameters(model.policy, src=0)
             if is_main_process():
-                print(f"✓ [Rank {rank}] DDP re-wrapping complete after resume, parameters synchronized")
+                print(f"✓ [Rank {rank}] DDP re-wrapped")
     else:
         if is_main_process():
             print(f"Architecture: {args.policy_arch}")
@@ -747,24 +799,43 @@ def main():
         except Exception as e:
             print(f"Warning: Could not start hardware monitoring: {e}")
     
-    # Train
+    # Train (adjust timesteps for DDP: each rank trains for total_timesteps)
+    # In true DDP, all ranks train the SAME number of steps with synchronized gradients
+    # The effective batch is world_size × n_envs × n_steps per update
     if is_main_process():
         total_envs = resource_config.n_envs * world_size if is_distributed() else resource_config.n_envs
-        print(f"\n🚀 Starting training for {config['training']['total_timesteps']:,} timesteps...")
+        print(f"\n🚀 Starting training for {config['training']['total_timesteps']:,} timesteps per rank...")
         print(f"Total environments across all ranks: {total_envs}")
-        print(f"Environments per rank: {resource_config.n_envs}\n")
+        print(f"Environments per rank: {resource_config.n_envs}")
+        print(f"Effective batch size per update: {total_envs * resource_config.n_steps}\n")
+    
+    training_timesteps = config['training']['total_timesteps']
+    if args.resume_from:
+        # FIXED: In DDP, all ranks must train for same number of steps
+        # Subtract existing timesteps consistently across all ranks
+        remaining = training_timesteps - model.num_timesteps
+        if is_distributed():
+            import torch.distributed as dist
+            remaining_tensor = torch.tensor([remaining], device=resource_config.device)
+            dist.broadcast(remaining_tensor, src=0)
+            training_timesteps = remaining_tensor.item()
+        else:
+            training_timesteps = remaining
+        
+        if is_main_process() and training_timesteps <= 0:
+            print(f"⚠️  Already trained for {model.num_timesteps:,} timesteps, skipping training")
+            training_timesteps = 0
     
     try:
-        model.learn(
-            total_timesteps=(
-                config['training']['total_timesteps'] - model.num_timesteps
-                if args.resume_from
-                else config['training']['total_timesteps']
-            ),
-            callback=callback_list,
-            log_interval=10,
-            progress_bar=True,
-        )
+        if training_timesteps > 0:
+            model.learn(
+                total_timesteps=training_timesteps,
+                callback=callback_list,
+                log_interval=10,
+                progress_bar=True if is_main_process() else False,
+            )
+        elif is_main_process():
+            print("⚠️  No training needed (already at target timesteps)")
     except KeyboardInterrupt:
         print("\n⚠️  Training interrupted by user")
     finally:
@@ -785,15 +856,27 @@ def main():
                           f"{gpu.memory_percent:.1f}% mem")
                 print("="*60)
     
-    # Save final model (rank 0 only, unwrap DDP first)
+    # Save final model (rank 0 only, unwrap DDP first, atomic write)
     if is_main_process():
         final_path = run_dir / "final_model.zip"
+        temp_path = run_dir / f"final_model.tmp.{os.getpid()}.zip"
         
         # Unwrap DDP before saving
         if is_distributed():
             model.policy = unwrap_model_ddp(model.policy)
         
-        model.save(str(final_path))
+        # Atomic save: write to temp with PID, then rename
+        try:
+            model.save(str(temp_path))
+            if temp_path.exists():
+                if final_path.exists():
+                    final_path.unlink()
+                temp_path.rename(final_path)
+                print(f"✓ Final model saved atomically to {final_path}")
+        except Exception as e:
+            print(f"Warning: Failed to save final model: {e}")
+            if temp_path.exists():
+                temp_path.unlink()
         
         # Save effective config (after auto-tuning)
         effective_config = config.copy()
