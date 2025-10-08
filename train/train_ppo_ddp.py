@@ -44,6 +44,7 @@ class Config:
     env_id: str = "Snake-v0"
     grid_size: int = 12
     total_timesteps: int = 5_000_000
+    max_hours: Optional[float] = None
     n_envs: int = 64
     n_steps: int = 1024
     n_epochs: int = 4
@@ -119,7 +120,10 @@ def train(config: Config):
         print(f"\n{'='*60}")
         print(f"Starting DDP PPO Training")
         print(f"{'='*60}")
-        print(f"Total timesteps: {config.total_timesteps:,}")
+        if config.max_hours:
+            print(f"Max training time: {config.max_hours:.1f} hours")
+        else:
+            print(f"Total timesteps: {config.total_timesteps:,}")
         print(f"World size: {world_size}")
         print(f"Envs per rank: {config.n_envs}")
         print(f"Global batch size: {config.n_envs * config.n_steps * world_size:,}")
@@ -158,9 +162,22 @@ def train(config: Config):
     episode_returns = []
     episode_lengths = []
     
-    num_updates = config.total_timesteps // (config.n_envs * config.n_steps * world_size)
+    if config.max_hours:
+        num_updates = 999999999
+        max_time = config.max_hours * 3600
+    else:
+        num_updates = config.total_timesteps // (config.n_envs * config.n_steps * world_size)
+        max_time = None
     
-    for update in range(1, num_updates + 1):
+    update = 0
+    while update < num_updates:
+        update += 1
+        
+        if max_time and (time.time() - start_time) >= max_time:
+            if is_main_process():
+                print(f"\n⏰ Time limit reached ({config.max_hours:.1f} hours)")
+            break
+        
         agent.eval()
         
         for step in range(config.n_steps):
@@ -288,6 +305,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="train/configs/base.yaml")
     parser.add_argument("--total-timesteps", type=int, default=None)
+    parser.add_argument("--max-hours", type=float, default=None, help="Train for exactly N hours (overrides total-timesteps)")
     parser.add_argument("--n-envs", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument("--grid-size", type=int, default=None)
@@ -311,6 +329,8 @@ def main():
                     if hasattr(config, key):
                         setattr(config, key, value)
     
+    if args.max_hours:
+        config.max_hours = args.max_hours
     if args.total_timesteps:
         config.total_timesteps = args.total_timesteps
     if args.n_envs:
