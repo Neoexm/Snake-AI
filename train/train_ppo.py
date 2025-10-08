@@ -17,7 +17,6 @@ from typing import Dict, Any, Optional
 import numpy as np
 import torch
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import (
     BaseCallback,
@@ -42,8 +41,6 @@ from train.ddp_utils import (
     is_main_process,
     get_rank,
     get_world_size,
-    wrap_model_ddp,
-    unwrap_model_ddp,
     broadcast_model_parameters,
     all_reduce_dict,
     barrier,
@@ -691,17 +688,6 @@ def main():
         
         if is_main_process():
             print(f"✓ Loaded checkpoint at {model.num_timesteps:,} timesteps")
-        
-        # Now wrap in DDP after sync + device move
-        if is_distributed():
-            model.policy = wrap_model_ddp(
-                model.policy,
-                device_ids=[rank],
-                output_device=rank,
-                find_unused_parameters=False,
-            )
-            if is_main_process():
-                print(f"✓ [Rank {rank}] DDP re-wrapped")
     else:
         if is_main_process():
             print(f"Architecture: {args.policy_arch}")
@@ -720,20 +706,11 @@ def main():
             verbose=1 if is_main_process() else 0,
         )
         
-        # CRITICAL: Wrap policy in DDP for true distributed training
-        if is_distributed():
-            model.policy = wrap_model_ddp(
-                model.policy,
-                device_ids=[rank],
-                output_device=rank,
-                find_unused_parameters=False,
-            )
-            # Broadcast initial parameters from rank 0 to all ranks
-            broadcast_model_parameters(model.policy, src=0)
-            if is_main_process():
-                print(f"✓ [Rank {rank}] DDP wrapping complete, parameters synchronized")
+        # NOTE: We do NOT wrap policy in DDP because Stable Baselines3
+        # expects direct access to policy methods that DDP doesn't expose.
+        # SB3 already handles parallelization via vectorized environments.
     
-    # Apply torch compile if requested (after DDP wrapping)
+    # Apply torch compile if requested
     if resource_config.compile_mode == "default":
         try:
             if hasattr(torch, 'compile'):
@@ -862,9 +839,6 @@ def main():
         temp_path = run_dir / f"final_model.tmp.{os.getpid()}.zip"
         
         # Unwrap DDP before saving
-        if is_distributed():
-            model.policy = unwrap_model_ddp(model.policy)
-        
         # Atomic save: write to temp with PID, then rename
         try:
             model.save(str(temp_path))
