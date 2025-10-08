@@ -210,9 +210,13 @@ def autoscale(
         n_envs = override_n_envs
     elif use_gpu:
         # Scale with GPU memory - more aggressive for high utilization
-        # NOTE: For DDP on 4×B200 GPUs, n_envs=64/GPU → 256 total environments
         mem_gb = gpu_info['primary_memory_gb']
-        if mem_gb >= 80:  # B200 (192GB), H100 (80GB), MI300X
+        if mem_gb >= 192:  # B200 specifically (192GB VRAM)
+            # B200: Massive VRAM allows much larger env counts
+            # DDP mode: 256 envs/GPU × 4 GPUs = 1024 total
+            # Single-GPU: 512 envs on one GPU
+            n_envs = 256 if max_utilization else 128
+        elif mem_gb >= 80:  # H100 (80GB), MI300X
             # DDP mode: 64 envs/GPU × 4 GPUs = 256 total
             # Single-GPU: 256 envs on one GPU
             n_envs = 64 if max_utilization else 48
@@ -243,7 +247,9 @@ def autoscale(
     # Larger for GPU (more memory), smaller for CPU
     if use_gpu:
         mem_gb = gpu_info['primary_memory_gb']
-        if mem_gb >= 80:  # B200, H100 - can handle larger rollouts
+        if mem_gb >= 192:  # B200 - can handle very large rollouts
+            n_steps = 2048 if max_utilization else 1024
+        elif mem_gb >= 80:  # H100 - can handle larger rollouts
             n_steps = 1024 if max_utilization else 512
         elif mem_gb >= 40:
             n_steps = 512 if max_utilization else 256
@@ -257,8 +263,11 @@ def autoscale(
     if use_gpu:
         mem_gb = gpu_info['primary_memory_gb']
         # Prefer larger batches on GPU for better throughput
-        # B200 with 64 envs × 1024 steps = 65536 samples/rank
-        if mem_gb >= 80:  # B200, H100 - can handle 8192+ batch sizes
+        # B200 with 256 envs × 2048 steps = 524288 samples/rank (max util)
+        # B200 with 128 envs × 1024 steps = 131072 samples/rank (standard)
+        if mem_gb >= 192:  # B200 - can handle very large batch sizes
+            batch_size = 32768 if max_utilization else 16384
+        elif mem_gb >= 80:  # H100 - can handle 8192+ batch sizes
             batch_size = 8192 if max_utilization else 4096
         elif mem_gb >= 40:
             batch_size = 4096 if max_utilization else 2048
@@ -290,7 +299,9 @@ def autoscale(
         policy_width = override_policy_width
     elif use_gpu:
         mem_gb = gpu_info['primary_memory_gb']
-        if mem_gb >= 80:  # B200, H100
+        if mem_gb >= 192:  # B200 - can handle wider networks
+            policy_width = 256 if max_utilization else 128
+        elif mem_gb >= 80:  # H100
             policy_width = 128
         elif mem_gb >= 40 and max_utilization:
             policy_width = 128
@@ -303,8 +314,14 @@ def autoscale(
     
     if override_policy_depth is not None:
         policy_depth = override_policy_depth
-    elif use_gpu and max_utilization:
-        policy_depth = 3
+    elif use_gpu:
+        mem_gb = gpu_info['primary_memory_gb']
+        if mem_gb >= 192:  # B200 - can handle deeper networks
+            policy_depth = 4 if max_utilization else 3
+        elif max_utilization:
+            policy_depth = 3
+        else:
+            policy_depth = 2
     else:
         policy_depth = 2
     
