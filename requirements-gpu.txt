@@ -24,7 +24,7 @@ tqdm>=4.66.0
 opencv-python>=4.10.0
 psutil>=5.9.0
 pillow>=11.0.0
-nvidia-ml-py3>=12.535.0
+nvidia-ml-py3>=7.352.0
 
 # Optional: W&B for advanced logging
 wandb>=0.16.0
