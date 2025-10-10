@@ -1,0 +1,20 @@
+seed: 42
+optimizer: adamw
+lr: 3.0e-4
+weight_decay: 0.01
+batch_size: 128
+grad_accum_steps: 4
+val_split: 0.1
+epochs: 200
+time_budget_min: null
+early_stop_patience: 10
+dropout: 0.1
+cnn_width: 64
+mlp_hidden_dims: [256, 256]
+amp: auto
+num_workers: auto
+pin_memory: auto
+augment:
+  enabled: false
+  random_crop_pad: false
+  hflip: false
