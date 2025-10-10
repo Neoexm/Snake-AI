@@ -40,9 +40,12 @@ env/
 
 # Training outputs
 runs/
+runs_bc/
+data/
 *.zip
 *.mp4
 *.avi
+*.pt
 
 # Logs
 *.log
