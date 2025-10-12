@@ -1,30 +1,81 @@
 """
 Interactive visualization of a trained Snake PPO agent.
 
+Supports both DDP checkpoints (.pt) and Stable Baselines3 models (.zip).
 Supports both local window display (OpenCV/Pygame) and headless mode for saving videos.
-CRITICAL: Does NOT set CUDA_VISIBLE_DEVICES to allow loading DDP-trained models.
 """
 
 import os
 import sys
 import argparse
-import yaml
+import re
 import time
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import torch
+import torch.nn as nn
 
-# Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from snake_env import SnakeEnv, RewardShaping, FrameStack
-from stable_baselines3 import PPO
+from train.models import SnakeScalableCNN
+import gymnasium as gym
+
+class Agent(nn.Module):
+    def __init__(self, obs_shape, action_dim, width=128, depth=3):
+        super().__init__()
+        self.feature_extractor = SnakeScalableCNN(
+            observation_space=gym.spaces.Box(0, 1, obs_shape, dtype=np.float32),
+            features_dim=256,
+            width=width,
+            depth=depth
+        )
+        self.actor = nn.Linear(256, action_dim)
+        self.critic = nn.Linear(256, 1)
+    
+    def forward(self, x):
+        features = self.feature_extractor(x)
+        return features
+    
+    def get_action_and_value(self, x, action=None):
+        features = self.forward(x)
+        logits = self.actor(features)
+        probs = torch.distributions.Categorical(logits=logits)
+        if action is None:
+            action = probs.sample()
+        return action, probs.log_prob(action), probs.entropy(), self.critic(features)
+    
+    def act(self, x):
+        features = self.forward(x)
+        logits = self.actor(features)
+        return logits.argmax(dim=-1)
+
+def latest_checkpoint(folder):
+    ckpts = [f for f in os.listdir(folder) if f.startswith("checkpoint_") and f.endswith(".pt")]
+    if not ckpts:
+        raise FileNotFoundError(f"No checkpoint_*.pt in {folder}")
+    key = lambda s: int(re.search(r"checkpoint_(\d+)\.pt", s).group(1))
+    return os.path.join(folder, sorted(ckpts, key=key)[-1])
+
+def load_model(model_path, device='cpu'):
+    if model_path.endswith('.pt'):
+        obs_shape = (3, 12, 12)
+        model = Agent(obs_shape=obs_shape, action_dim=4, width=128, depth=3).to(device)
+        ckpt = torch.load(model_path, map_location=device)
+        sd = ckpt.get("agent") or ckpt.get("model_state_dict") or ckpt.get("state_dict") or ckpt
+        model.load_state_dict(sd, strict=True)
+        model.eval()
+        return model, 'ddp'
+    else:
+        from stable_baselines3 import PPO
+        return PPO.load(model_path, device=device), 'sb3'
 
 
 def play_local_window(
     model_path: str,
-    config_path: str,
+    config_path: Optional[str] = None,
     fps: int = 10,
     deterministic: bool = True,
     n_episodes: Optional[int] = None,
@@ -36,9 +87,9 @@ def play_local_window(
     Parameters
     ----------
     model_path : str
-        Path to the saved model (.zip file).
-    config_path : str
-        Path to the config file.
+        Path to the saved model (.pt or .zip file).
+    config_path : str, optional
+        Path to the config file (not needed for DDP checkpoints).
     fps : int
         Frames per second for display.
     deterministic : bool
@@ -55,37 +106,16 @@ def play_local_window(
         print("Install with: pip install opencv-python")
         sys.exit(1)
     
-    # Load config
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    
-    # Load model (auto-detect available GPU)
     print(f"Loading model from: {model_path}")
-    
-    import torch
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = PPO.load(model_path, device=device)
+    model, model_type = load_model(model_path, device)
     
-    # Create environment
-    env = SnakeEnv(
-        grid_size=config['environment']['grid_size'],
-        max_steps=config['environment'].get('max_steps'),
-        render_mode="rgb_array",
-    )
-    
-    env = RewardShaping(
-        env,
-        step_penalty=config['environment']['step_penalty'],
-        death_penalty=config['environment']['death_penalty'],
-        food_reward=config['environment']['food_reward'],
-        distance_reward_scale=config['environment'].get('distance_reward_scale', 0.0),
-    )
-    
-    if config['environment'].get('frame_stack', 1) > 1:
-        env = FrameStack(env, n_frames=config['environment']['frame_stack'])
+    env = SnakeEnv(grid_size=12, render_mode="rgb_array")
+    env = RewardShaping(env)
+    env = FrameStack(env, n_frames=1)
     
     print(f"\n🎮 Playing Snake (Press ESC to quit, SPACE to reset)")
-    print(f"FPS: {fps}, Deterministic: {deterministic}\n")
+    print(f"Model type: {model_type.upper()}, FPS: {fps}, Deterministic: {deterministic}\n")
     
     episode = 0
     while n_episodes is None or episode < n_episodes:
@@ -95,17 +125,20 @@ def play_local_window(
         done = False
         
         while not done:
-            # Get action from model
-            action, _ = model.predict(obs, deterministic=deterministic)
-            obs, reward, terminated, truncated, info = env.step(int(action))
+            with torch.no_grad():
+                if model_type == 'ddp':
+                    x = torch.from_numpy(obs).unsqueeze(0).float().to(device)
+                    action = model.act(x).item()
+                else:
+                    action, _ = model.predict(obs, deterministic=deterministic)
+                    action = int(action)
+            
+            obs, reward, terminated, truncated, info = env.step(action)
             episode_reward += reward
             episode_length += 1
             done = terminated or truncated
             
-            # Render
             frame = env.render()
-            
-            # Add info overlay
             frame_with_info = frame.copy()
             text_lines = [
                 f"Episode: {episode + 1}",
@@ -128,22 +161,20 @@ def play_local_window(
                 )
                 y_offset += 25
             
-            # Display
             cv2.imshow("Snake Agent", cv2.cvtColor(frame_with_info, cv2.COLOR_RGB2BGR))
             
-            # Handle keyboard
             key = cv2.waitKey(int(1000 / fps))
-            if key == 27:  # ESC
+            if key == 27:
                 print("\n👋 Exiting...")
                 cv2.destroyAllWindows()
                 return
-            elif key == 32:  # SPACE
+            elif key == 32:
                 print(f"⏭️  Skipping to next episode...")
                 break
             
             if done:
                 print(f"Episode {episode + 1}: Reward={episode_reward:.1f}, Length={episode_length}, Snake Size={info.get('length', 0)}")
-                time.sleep(1.0)  # Pause briefly to show final state
+                time.sleep(1.0)
         
         episode += 1
     
@@ -153,7 +184,6 @@ def play_local_window(
 
 def play_headless_video(
     model_path: str,
-    config_path: str,
     output_path: str,
     fps: int = 10,
     n_episodes: int = 1,
@@ -161,21 +191,6 @@ def play_headless_video(
 ):
     """
     Save episodes to video file (headless mode).
-    
-    Parameters
-    ----------
-    model_path : str
-        Path to the saved model (.zip file).
-    config_path : str
-        Path to the config file.
-    output_path : str
-        Output video file path (.mp4, .avi, etc.).
-    fps : int
-        Frames per second.
-    n_episodes : int
-        Number of episodes to record.
-    seed : int
-        Random seed.
     """
     try:
         import cv2
@@ -183,36 +198,14 @@ def play_headless_video(
         print("ERROR: opencv-python is required for video recording.")
         sys.exit(1)
     
-    # Load config
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    
-    # Load model (auto-detect available GPU)
     print(f"Loading model from: {model_path}")
-    
-    import torch
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = PPO.load(model_path, device=device)
+    model, model_type = load_model(model_path, device)
     
-    # Create environment
-    env = SnakeEnv(
-        grid_size=config['environment']['grid_size'],
-        max_steps=config['environment'].get('max_steps'),
-        render_mode="rgb_array",
-    )
+    env = SnakeEnv(grid_size=12, render_mode="rgb_array")
+    env = RewardShaping(env)
+    env = FrameStack(env, n_frames=1)
     
-    env = RewardShaping(
-        env,
-        step_penalty=config['environment']['step_penalty'],
-        death_penalty=config['environment']['death_penalty'],
-        food_reward=config['environment']['food_reward'],
-        distance_reward_scale=config['environment'].get('distance_reward_scale', 0.0),
-    )
-    
-    if config['environment'].get('frame_stack', 1) > 1:
-        env = FrameStack(env, n_frames=config['environment']['frame_stack'])
-    
-    # Initialize video writer
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     writer = None
     
@@ -223,18 +216,23 @@ def play_headless_video(
         done = False
         
         while not done:
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = env.step(int(action))
+            with torch.no_grad():
+                if model_type == 'ddp':
+                    x = torch.from_numpy(obs).unsqueeze(0).float().to(device)
+                    action = model.act(x).item()
+                else:
+                    action, _ = model.predict(obs, deterministic=True)
+                    action = int(action)
+            
+            obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
             
             frame = env.render()
             
-            # Initialize writer on first frame
             if writer is None:
                 h, w = frame.shape[:2]
                 writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
             
-            # Write frame (convert RGB to BGR)
             writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
     
     writer.release()
@@ -251,14 +249,20 @@ def parse_args():
     parser.add_argument(
         "--model",
         type=str,
-        required=True,
-        help="Path to trained model (.zip)",
+        default=None,
+        help="Path to trained model (.pt or .zip) or folder with checkpoints",
+    )
+    parser.add_argument(
+        "--folder",
+        type=str,
+        default=None,
+        help="Folder with checkpoint_*.pt files (uses latest)",
     )
     parser.add_argument(
         "--config",
         type=str,
         default=None,
-        help="Path to config file (auto-detect from model dir if not provided)",
+        help="Path to config file (not needed for DDP checkpoints)",
     )
     parser.add_argument(
         "--fps",
@@ -314,23 +318,17 @@ def main():
     """Main play function."""
     args = parse_args()
     
-    # Auto-detect config if not provided
-    config_path = args.config
-    if config_path is None:
-        model_dir = Path(args.model).parent
-        config_path = model_dir / "config.yaml"
-        if not config_path.exists():
-            config_path = model_dir.parent / "config.yaml"
-        
-        if not config_path.exists():
-            raise FileNotFoundError(
-                f"Could not find config.yaml. Please specify --config explicitly."
-            )
+    if args.folder:
+        model_path = latest_checkpoint(args.folder)
+        print(f"Using latest checkpoint: {model_path}")
+    elif args.model:
+        model_path = args.model
+    else:
+        raise ValueError("Must specify either --model or --folder")
     
     deterministic = not args.stochastic
     
     if args.video or args.record:
-        # Headless video mode
         if args.record:
             output_dir = Path(args.output)
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -340,8 +338,7 @@ def main():
             for ep in range(n_eps):
                 output_path = output_dir / f"episode_{ep+1:03d}.mp4"
                 play_headless_video(
-                    model_path=args.model,
-                    config_path=str(config_path),
+                    model_path=model_path,
                     output_path=str(output_path),
                     fps=args.fps,
                     n_episodes=1,
@@ -350,18 +347,16 @@ def main():
             print(f"✅ All videos saved to: {output_dir}")
         else:
             play_headless_video(
-                model_path=args.model,
-                config_path=str(config_path),
+                model_path=model_path,
                 output_path=args.video,
                 fps=args.fps,
                 n_episodes=args.n_episodes or 1,
                 seed=args.seed,
             )
     else:
-        # Local window mode
         play_local_window(
-            model_path=args.model,
-            config_path=str(config_path),
+            model_path=model_path,
+            config_path=args.config,
             fps=args.fps,
             deterministic=deterministic,
             n_episodes=args.n_episodes,

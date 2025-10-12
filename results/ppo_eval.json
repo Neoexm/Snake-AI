@@ -1,0 +1,12 @@
+{
+  "n_episodes": 1000,
+  "mean_reward": 33.28139999999984,
+  "std_reward": 3.5622953611401473,
+  "min_reward": 8.270000000000012,
+  "max_reward": 41.610000000000134,
+  "mean_length": 413.789,
+  "std_length": 171.9312260149389,
+  "min_length": 84,
+  "max_length": 2400,
+  "seed": 2025
+}
